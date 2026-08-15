@@ -136,6 +136,21 @@ large_file_threshold = 104857600
 # Useful for previewing changes before committing
 dry_run = false
 
+# ============================================================
+# FILENAME UNIFICATION (RENAME)
+# ============================================================
+
+# Unify filenames based on EXIF / FFprobe metadata.
+# When enabled, files are renamed in place to YYYYMMDD_HHMMSS.ext using the
+# creation time parsed from EXIF (images) or FFprobe (videos).
+# Files without parseable metadata are left unchanged and listed in the
+# unmodified files list.
+unify_filenames = false
+
+# Custom path for the unmodified files list (rename mode only).
+# Leave commented to use default: <output_dir>/unmodified_files.txt
+# unmodified_list_file = "D:/Photos/unmodified_files.txt"
+
 # Verbose output - shows detailed processing information
 # Useful for debugging or understanding what's happening
 verbose = false

@@ -71,6 +71,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         );
     }
 
+    if state.summary_state.cancelled {
+        stats_lines.push(Line::from(""));
+        stats_lines.push(
+            Line::from(t!("processing_cancelled"))
+                .style(theme().warning().add_modifier(Modifier::BOLD)),
+        );
+    }
+
     let failed_count = state
         .summary_state
         .results

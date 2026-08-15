@@ -15,5 +15,6 @@ pub use progress::ProgressState;
 pub use selection::{Selectable, SelectionState};
 pub use summary::SummaryState;
 pub use wizard::{
-    BoolSelection, ConfigFormState, ConfigStep, ConfigWizardState, EnumSelection, FormField,
+    BoolSelection, ConfigFormState, ConfigStep, ConfigWizardState, Effect, EnumSelection,
+    FormField, WizardFlow, transition,
 };

@@ -21,6 +21,8 @@ pub mod config {
     pub const VALUE_TRUNCATE_LENGTH: usize = 40;
     /// Highlight symbol for selected items
     pub const HIGHLIGHT_SYMBOL: &str = "▶ ";
+    /// 进度屏渲染节流间隔（帧序号每隔 N 帧重绘一次）
+    pub const PROGRESS_RENDER_THROTTLE: u64 = 2;
 }
 
 /// Theme color configuration

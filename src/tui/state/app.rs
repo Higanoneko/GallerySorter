@@ -13,8 +13,6 @@ pub struct TuiResult {
     pub config: crate::config::Config,
     /// 配置名称
     pub config_name: Option<String>,
-    /// 是否在 TUI 内执行处理
-    pub run_processing: bool,
 }
 
 /// 应用状态（包含 UI 状态）
@@ -67,4 +65,56 @@ pub fn reset_to_main_menu(state: &mut AppState) {
     state.should_exit = false;
     state.result = None;
     state.select_state.select(Some(0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_result() -> TuiResult {
+        TuiResult {
+            config: crate::config::Config::default(),
+            config_name: Some("album".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_reset_to_main_menu_clears_result_and_returns_to_main_menu() {
+        let mut state = AppState {
+            current_screen: Screen::Summary,
+            should_exit: true,
+            result: Some(sample_result()),
+            ..Default::default()
+        };
+
+        reset_to_main_menu(&mut state);
+
+        assert_eq!(state.current_screen, Screen::MainMenu);
+        assert!(!state.should_exit);
+        assert!(state.result.is_none());
+        assert_eq!(state.config_wizard.step, ConfigWizardState::new().step);
+    }
+
+    #[test]
+    fn test_tui_result_persisted_until_taken() {
+        let mut state = AppState {
+            result: Some(sample_result()),
+            ..Default::default()
+        };
+
+        // run() 在退出前 take()：结果只被消费一次
+        let taken = state.result.take();
+        assert!(taken.is_some());
+        assert!(state.result.is_none());
+    }
+
+    #[test]
+    fn test_tui_result_holds_config_and_name() {
+        let result = sample_result();
+
+        assert_eq!(result.config_name, Some("album".to_string()));
+        // config 字段可被取出用于启动处理
+        let config = result.config;
+        assert!(config.deduplicate);
+    }
 }

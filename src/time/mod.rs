@@ -11,7 +11,7 @@ pub mod filename;
 pub mod video;
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use chrono::NaiveDateTime;
 use std::fs;
 use std::path::Path;
@@ -180,9 +180,39 @@ pub fn extract_time(path: &Path, config: &Config) -> Result<ExtractedTime> {
     })
 }
 
+/// 仅基于 EXIF（图片）或 FFprobe 视频元数据提取创建时间。
+///
+/// 与 [`extract_time`] 不同，本函数不做文件名 / 文件系统时间回退，
+/// 用于“没有 EXIF/FFmpeg 解析信息就不处理”的场景（如文件名统一化）。
+pub fn extract_metadata_time(path: &Path, config: &Config) -> Result<ExtractedTime> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    if config.is_image(ext) {
+        let timestamp = exif::extract_exif_time(path)?;
+        return Ok(ExtractedTime {
+            timestamp,
+            source: TimeSource::Exif,
+        });
+    }
+
+    if config.is_video(ext) {
+        let timestamp = video::extract_video_time(path)?;
+        return Ok(ExtractedTime {
+            timestamp,
+            source: TimeSource::VideoMetadata,
+        });
+    }
+
+    Err(Error::UnsupportedFormat {
+        path: path.to_path_buf(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_time_source_debug() {
@@ -190,5 +220,27 @@ mod tests {
         assert_eq!(format!("{:?}", TimeSource::VideoMetadata), "VideoMetadata");
         assert_eq!(format!("{:?}", TimeSource::Filename), "Filename");
         assert_eq!(format!("{:?}", TimeSource::FileSystem), "FileSystem");
+    }
+
+    #[test]
+    fn test_extract_metadata_time_image_without_exif_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        fs::write(&path, b"not a real jpeg").unwrap();
+
+        let result = extract_metadata_time(&path, &Config::default());
+
+        assert!(result.is_err(), "file without EXIF must not produce a time");
+    }
+
+    #[test]
+    fn test_extract_metadata_time_unsupported_extension_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        fs::write(&path, b"hello").unwrap();
+
+        let result = extract_metadata_time(&path, &Config::default());
+
+        assert!(matches!(result, Err(Error::UnsupportedFormat { .. })));
     }
 }

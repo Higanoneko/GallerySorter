@@ -11,6 +11,9 @@ Gallery Sorter is a CLI + TUI tool for organizing photos and videos by creation 
 - Flexible classification: none/year/year-month, nested or combined month format
 - Processing modes: incremental (default), supplement, full
 - Parallel processing with configurable threads and dry-run support
+- Filename unification: rename files in place to `YYYYMMDD_HHMMSS.ext` from
+  EXIF / FFprobe metadata; files without metadata stay unchanged and are
+  written to an unmodified-files list
 - Interactive Ratatui wizard and full CLI automation
 - Bilingual UI (English and Simplified Chinese)
 
@@ -70,6 +73,9 @@ gallery-sorter \
   --operation copy \
   --deduplicate \
   --dry-run
+
+# Filename unification (in-place rename, EXIF / FFprobe metadata only)
+gallery-sorter --unify-filenames -i /path/to/photos
 ```
 
 ### Options
@@ -89,8 +95,23 @@ gallery-sorter \
 | `--threads` | `-t` | Thread count (0 = auto) |
 | `--large-file-mb` |  | Large-file threshold in MB |
 | `--dry-run` | `-n` | Preview without writing |
+| `--unify-filenames` |  | Unify filenames from EXIF / FFprobe metadata (in-place rename) |
+| `--unmodified-list` |  | Path for the unmodified files list (default `<output_dir>/unmodified_files.txt`) |
 | `--verbose` | `-v` | Verbose output |
 | `--json-log` |  | JSON formatted logs |
+
+### Filename Unification
+
+`--unify-filenames` scans the input directories and parses the creation time
+from EXIF (images) or FFprobe (videos) only, then renames each file in place to
+`YYYYMMDD_HHMMSS.ext` (e.g. `IMG_20240115_143022.jpg` →
+`20240115_143022.jpg`). Collisions in the same directory get `_1`, `_2`, ...
+suffixes automatically.
+
+Files whose creation time cannot be parsed from metadata are left unchanged;
+their paths are written to the unmodified files list (default
+`<output_dir>/unmodified_files.txt`, overridable with `--unmodified-list`).
+Dry-run mode (`--dry-run`) writes neither the list nor any filename change.
 
 ## Configuration
 
@@ -110,6 +131,7 @@ classify_by_type = false
 operation = "copy"
 deduplicate = true
 dry_run = false
+unify_filenames = false
 verbose = false
 ```
 

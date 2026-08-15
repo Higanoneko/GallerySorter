@@ -30,7 +30,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ConfigStep::ConfigForm => draw_config_form(frame, body, state),
         ConfigStep::Summary => draw_summary_step(frame, body, &state.config_wizard),
         ConfigStep::ConfirmRun => draw_confirm_run_step(frame, body, state),
-        _ => {}
     }
 
     let hint_text = match state.config_wizard.step {
@@ -38,7 +37,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ConfigStep::ConfigForm => get_form_hint(&state.config_wizard),
         ConfigStep::ConfigSelect => t!("select_config_hint"),
         ConfigStep::Summary => {
-            if state.config_wizard.skip_confirm_run {
+            if state.config_wizard.is_run_direct_flow() {
                 t!("config_summary_hint")
             } else if state.config_wizard.is_select_config_flow() {
                 t!("config_summary_modify_hint")
@@ -53,7 +52,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 t!("confirm_run_hint")
             }
         }
-        _ => t!("nav_hint"),
     };
 
     render_hint(&hint_text, frame, footer);
@@ -303,6 +301,13 @@ fn draw_summary_step(frame: &mut Frame, area: Rect, wizard: &ConfigWizardState) 
     rows.push(Row::new(vec![
         Cell::from(t!("summary_dry_run")),
         Cell::from(wrap_lines(bool_label(config.dry_run).as_ref(), value_width)),
+    ]));
+    rows.push(Row::new(vec![
+        Cell::from(t!("summary_unify_filenames")),
+        Cell::from(wrap_lines(
+            bool_label(config.unify_filenames).as_ref(),
+            value_width,
+        )),
     ]));
 
     let table = Table::new(rows, [Constraint::Length(15), Constraint::Fill(1)])

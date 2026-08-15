@@ -5,11 +5,12 @@
 use crate::config::Config;
 use crate::tui::event::{EventPoll, TuiEvent};
 use crate::tui::state::{
-    AppState, ConfigFormState, ConfigStep, ConfigWizardState, Screen, Selectable, TuiResult,
-    reset_to_main_menu,
+    AppState, ConfigFormState, ConfigStep, ConfigWizardState, Effect, MenuItem, Screen, Selectable,
+    TuiResult, WizardFlow, reset_to_main_menu, transition,
 };
 use crate::tui::ui::{render, run_processing};
 use ratatui::DefaultTerminal;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 /// TUI 应用
@@ -23,8 +24,8 @@ pub struct TuiApp {
     pub state: AppState,
     /// 日志路径
     log_path: Option<PathBuf>,
-    /// 是否执行处理
-    should_run_processing: bool,
+    /// 待执行效果队列
+    effect_queue: VecDeque<Effect>,
 }
 
 impl TuiApp {
@@ -39,7 +40,7 @@ impl TuiApp {
             event_poll,
             state,
             log_path: None,
-            should_run_processing: false,
+            effect_queue: VecDeque::new(),
         })
     }
 
@@ -53,22 +54,14 @@ impl TuiApp {
         render(&mut self.terminal, &mut self.state)?;
 
         loop {
-            if self.should_run_processing {
-                let config = self.state.result.as_ref().map(|r| r.config.clone());
-                if let Some(cfg) = config {
-                    self.state.current_screen = Screen::Progress;
-                    render(&mut self.terminal, &mut self.state)?;
-
-                    let summary_state =
-                        run_processing(&mut self.terminal, cfg, self.log_path.clone())?;
-
-                    self.state.summary_state = summary_state;
-                    self.state.current_screen = Screen::Summary;
-                    self.should_run_processing = false;
-                    render(&mut self.terminal, &mut self.state)?;
-                }
+            // 执行效果队列
+            if !self.effect_queue.is_empty() {
+                self.execute_effects()?;
+                render(&mut self.terminal, &mut self.state)?;
+                continue;
             }
 
+            // 收集事件
             match self.event_poll.next() {
                 TuiEvent::Resize(_, _) => {
                     render(&mut self.terminal, &mut self.state)?;
@@ -80,6 +73,7 @@ impl TuiApp {
                     break;
                 }
                 event => {
+                    // 转换
                     if self.handle_event(event)? {
                         if self.state.current_screen == Screen::Summary {
                             reset_to_main_menu(&mut self.state);
@@ -88,6 +82,7 @@ impl TuiApp {
                         }
                         break;
                     }
+                    // 重绘
                     render(&mut self.terminal, &mut self.state)?;
                 }
             }
@@ -111,37 +106,36 @@ impl TuiApp {
         match event {
             TuiEvent::Up | TuiEvent::Left => self.state.menu_state.prev(),
             TuiEvent::Down | TuiEvent::Right => self.state.menu_state.next(),
-            TuiEvent::Enter => match self.state.menu_state.selected() {
-                3 => return Ok(true),
-                0 => {
-                    self.state.current_screen = Screen::ConfigWizard;
-                    self.state.config_wizard = ConfigWizardState::new();
-                    self.state.config_wizard.step = ConfigStep::ConfigForm;
-                    self.state.config_wizard.skip_confirm_run = true;
-                    self.state.config_wizard.from_config_select = false;
-                    self.state.config_wizard.need_modify_confirm = false;
-                    self.state.config_wizard.form_state.selected_field = 0;
+            TuiEvent::Enter => {
+                let item = MenuItem::iter().nth(self.state.menu_state.selected());
+                match item {
+                    Some(MenuItem::Exit) => return Ok(true),
+                    Some(MenuItem::RunDirect) => {
+                        self.state.current_screen = Screen::ConfigWizard;
+                        self.state.config_wizard = ConfigWizardState::new();
+                        self.state.config_wizard.step = ConfigStep::ConfigForm;
+                        self.state.config_wizard.flow = WizardFlow::RunDirect;
+                        self.state.config_wizard.form_state.selected_field = 0;
+                    }
+                    Some(MenuItem::RunConfig) => {
+                        self.state.current_screen = Screen::ConfigWizard;
+                        self.state.config_wizard = ConfigWizardState::new();
+                        self.state.config_wizard.step = ConfigStep::ConfigSelect;
+                        self.state.config_wizard.flow = WizardFlow::RunFromConfig {
+                            need_modify_confirm: true,
+                        };
+                        self.effect_queue.push_back(Effect::RefreshConfigs);
+                    }
+                    Some(MenuItem::CreateConfig) => {
+                        self.state.current_screen = Screen::ConfigWizard;
+                        self.state.config_wizard = ConfigWizardState::new();
+                        self.state.config_wizard.step = ConfigStep::ConfigForm;
+                        self.state.config_wizard.flow = WizardFlow::CreateConfig;
+                        self.state.config_wizard.form_state.selected_field = 0;
+                    }
+                    None => {}
                 }
-                1 => {
-                    self.state.current_screen = Screen::ConfigWizard;
-                    self.state.config_wizard = ConfigWizardState::new();
-                    self.state.config_wizard.step = ConfigStep::ConfigSelect;
-                    self.state.config_wizard.skip_confirm_run = false;
-                    self.state.config_wizard.from_config_select = true;
-                    self.state.config_wizard.need_modify_confirm = true;
-                    self.state.config_wizard.refresh_configs();
-                }
-                2 => {
-                    self.state.current_screen = Screen::ConfigWizard;
-                    self.state.config_wizard = ConfigWizardState::new();
-                    self.state.config_wizard.step = ConfigStep::ConfigForm;
-                    self.state.config_wizard.skip_confirm_run = false;
-                    self.state.config_wizard.from_config_select = false;
-                    self.state.config_wizard.need_modify_confirm = false;
-                    self.state.config_wizard.form_state.selected_field = 0;
-                }
-                _ => {}
-            },
+            }
             TuiEvent::Escape => return Ok(true),
             _ => {}
         }
@@ -149,255 +143,111 @@ impl TuiApp {
     }
 
     fn handle_config_wizard(&mut self, event: TuiEvent) -> std::io::Result<bool> {
-        let step = self.state.config_wizard.step.clone();
-
-        match event {
-            TuiEvent::Up => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.input_move_to_start();
-                } else {
-                    match step {
-                        ConfigStep::ConfigForm => self.state.config_wizard.navigate_form_prev(),
-                        ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
-                            self.state.config_wizard.navigate_prev()
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            TuiEvent::Down => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.input_move_to_end();
-                } else {
-                    match step {
-                        ConfigStep::ConfigForm => self.state.config_wizard.navigate_form_next(),
-                        ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
-                            self.state.config_wizard.navigate_next()
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            TuiEvent::Left => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.input_move_left();
-                } else {
-                    match step {
-                        ConfigStep::ConfigForm => {
-                            if !self.state.config_wizard.is_next_selected() {
-                                self.state.config_wizard.toggle_current_field_prev();
-                            }
-                        }
-                        ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
-                            self.state.config_wizard.navigate_prev();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            TuiEvent::Right => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.input_move_right();
-                } else {
-                    match step {
-                        ConfigStep::ConfigForm => {
-                            if !self.state.config_wizard.is_next_selected() {
-                                self.state.config_wizard.toggle_current_field_next();
-                            }
-                        }
-                        ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
-                            self.state.config_wizard.navigate_next();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            TuiEvent::Enter => match step {
-                ConfigStep::ConfigSelect => {
-                    if !self.state.config_wizard.can_confirm_config_select() {
-                        return Ok(false);
-                    }
-
-                    self.state.config_wizard.ensure_selection();
-                    let selected = self.state.config_wizard.selected_value();
-                    let selected_path = self
-                        .state
-                        .config_wizard
-                        .available_configs
-                        .get(selected)
-                        .cloned();
-
-                    if let Some(path) = selected_path {
-                        match Config::load_from_file(&path) {
-                            Ok(config) => {
-                                self.state.config_wizard.init_from_config(&config, &path);
-                                self.state.config_wizard.config_saved = true;
-                                self.state.config_wizard.config_path = Some(path);
-                                self.state.config_wizard.error_message = None;
-                                self.state.config_wizard.form_state = ConfigFormState::new();
-                                self.state.config_wizard.need_modify_confirm = true;
-                                self.state.config_wizard.step = ConfigStep::Summary;
-                            }
-                            Err(err) => {
-                                self.state.config_wizard.error_message = Some(err.to_string());
-                            }
-                        }
-                    }
-                }
-                ConfigStep::ConfirmRun => {
-                    self.state.config_wizard.ensure_selection();
-                    let selected = self.state.config_wizard.selected_value();
-
-                    if self.state.config_wizard.is_select_config_flow() {
-                        if selected == 0 {
-                            self.state.config_wizard.need_modify_confirm = false;
-                            self.state.config_wizard.form_state = ConfigFormState::new();
-                            self.state.config_wizard.step = ConfigStep::ConfigForm;
-                        } else {
-                            let config = self.state.config_wizard.build_config();
-                            self.state.result = Some(TuiResult {
-                                config,
-                                config_name: Some(self.state.config_wizard.config_name.clone()),
-                                run_processing: true,
-                            });
-                            self.should_run_processing = true;
-                            return Ok(false);
-                        }
-                    } else {
-                        if self.state.config_wizard.config_name.is_empty()
-                            || !self.state.config_wizard.config_saved
-                        {
-                            let _ = self.state.config_wizard.save_config();
-                        }
-
-                        if selected == 0 {
-                            let config = self.state.config_wizard.build_config();
-                            self.state.result = Some(TuiResult {
-                                config,
-                                config_name: Some(self.state.config_wizard.config_name.clone()),
-                                run_processing: true,
-                            });
-                            self.should_run_processing = true;
-                            return Ok(false);
-                        } else {
-                            reset_to_main_menu(&mut self.state);
-                            return Ok(false);
-                        }
-                    }
-                }
-                ConfigStep::ConfigForm => {
-                    if self.state.config_wizard.is_in_input_mode() {
-                        self.state.config_wizard.exit_input_mode_apply();
-                    } else if self.state.config_wizard.is_next_selected() {
-                        if self.state.config_wizard.validate_form().is_ok() {
-                            self.state.config_wizard.step = ConfigStep::Summary;
-                        } else {
-                            self.state.config_wizard.error_message =
-                                self.state.config_wizard.validate_form().err();
-                        }
-                    } else if let Some(field) = self.state.config_wizard.selected_form_field()
-                        && field.is_input_field()
-                    {
-                        self.state.config_wizard.enter_input_mode_for_field();
-                    }
-                }
-                ConfigStep::Summary => {
-                    if self.state.config_wizard.skip_confirm_run
-                        || (self.state.config_wizard.is_select_config_flow()
-                            && !self.state.config_wizard.need_modify_confirm)
-                    {
-                        let config = self.state.config_wizard.build_config();
-                        let config_name = if self.state.config_wizard.skip_confirm_run {
-                            None
-                        } else {
-                            Some(self.state.config_wizard.config_name.clone())
-                        };
-                        self.state.result = Some(TuiResult {
-                            config,
-                            config_name,
-                            run_processing: true,
-                        });
-                        self.should_run_processing = true;
-                        return Ok(false);
-                    } else {
-                        self.state.config_wizard.step = ConfigStep::ConfirmRun;
-                        if self.state.config_wizard.is_select_config_flow() {
-                            self.state.config_wizard.set_selected(1);
-                        }
-                        self.state.config_wizard.ensure_selection();
-                    }
-                }
-                _ => {}
-            },
-            TuiEvent::Char(c) => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.input_insert_char(c);
-                }
-            }
-            TuiEvent::Backspace => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.input_backspace();
-                }
-            }
-            TuiEvent::Delete => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.input_delete();
-                }
-            }
-            TuiEvent::Home => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.input_move_to_start();
-                }
-            }
-            TuiEvent::End => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.input_move_to_end();
-                }
-            }
-            TuiEvent::Escape => {
-                if self.state.config_wizard.is_in_input_mode() {
-                    self.state.config_wizard.exit_input_mode_cancel();
-                } else {
-                    match step {
-                        ConfigStep::ConfirmRun => {
-                            self.state.config_wizard.step = ConfigStep::Summary;
-                        }
-                        ConfigStep::ConfigForm => {
-                            if self.state.config_wizard.from_config_select {
-                                self.state.config_wizard.step = ConfigStep::ConfigSelect;
-                            } else {
-                                reset_to_main_menu(&mut self.state);
-                            }
-                        }
-                        ConfigStep::Summary => {
-                            if self.state.config_wizard.is_select_config_flow()
-                                && self.state.config_wizard.need_modify_confirm
-                            {
-                                self.state.config_wizard.step = ConfigStep::ConfigSelect;
-                            } else {
-                                self.state.config_wizard.step = ConfigStep::ConfigForm;
-                            }
-                        }
-                        ConfigStep::ConfigSelect | ConfigStep::ConfigName => {
-                            reset_to_main_menu(&mut self.state);
-                        }
-                    }
-                }
-            }
-            TuiEvent::Tab => {
-                if !self.state.config_wizard.is_in_input_mode() {
-                    match step {
-                        ConfigStep::ConfigForm => self.state.config_wizard.navigate_form_next(),
-                        ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
-                            self.state.config_wizard.navigate_next()
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
+        let effects = transition(&mut self.state, event);
+        self.effect_queue.extend(effects);
         Ok(false)
+    }
+
+    /// 在边缘执行效果队列（唯一执行副作用的地方）
+    fn execute_effects(&mut self) -> std::io::Result<()> {
+        while let Some(effect) = self.effect_queue.pop_front() {
+            match effect {
+                Effect::LoadConfig(path) => match Config::load_from_file(&path) {
+                    Ok(config) => {
+                        self.state.config_wizard.init_from_config(&config, &path);
+                        self.state.config_wizard.config_path = Some(path);
+                        self.state.config_wizard.error_message = None;
+                        self.state.config_wizard.form_state = ConfigFormState::new();
+                        self.state.config_wizard.flow = WizardFlow::RunFromConfig {
+                            need_modify_confirm: true,
+                        };
+                        self.state.config_wizard.step = ConfigStep::Summary;
+                    }
+                    Err(err) => {
+                        self.state.config_wizard.error_message = Some(err.to_string());
+                    }
+                },
+                Effect::SaveConfig(name) => {
+                    let _ = self.save_config_to_disk(&name);
+                }
+                Effect::RefreshConfigs => {
+                    self.refresh_configs_from_disk();
+                }
+                Effect::RunProcessing {
+                    config,
+                    config_name,
+                } => {
+                    let run_config = (*config).clone();
+                    self.state.current_screen = Screen::Progress;
+                    render(&mut self.terminal, &mut self.state)?;
+
+                    let summary_state =
+                        run_processing(&mut self.terminal, run_config, self.log_path.clone())?;
+
+                    self.state.summary_state = summary_state;
+                    self.state.current_screen = Screen::Summary;
+                    self.state.result = Some(TuiResult {
+                        config: *config,
+                        config_name,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 保存配置到磁盘（含 current_exe() 路径解析，IO 边缘执行）
+    fn save_config_to_disk(&mut self, name: &str) -> Result<PathBuf, String> {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let config_dir = exe_dir.join("Config");
+
+        std::fs::create_dir_all(&config_dir)
+            .map_err(|e| format!("Failed to create config directory: {}", e))?;
+
+        let config_path = config_dir.join(name).with_extension("toml");
+        let config = self.state.config_wizard.build_config();
+        let content = toml::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+
+        std::fs::write(&config_path, content)
+            .map_err(|e| format!("Failed to write config file: {}", e))?;
+
+        self.state.config_wizard.config_path = Some(config_path.clone());
+        Ok(config_path)
+    }
+
+    /// 扫描 Config 目录（含 current_exe() 路径解析，IO 边缘执行）
+    fn refresh_configs_from_disk(&mut self) {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let config_dir = exe_dir.join("Config");
+
+        let paths = if !config_dir.exists() {
+            Vec::new()
+        } else {
+            std::fs::read_dir(&config_dir)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .map(|ext| ext == std::ffi::OsStr::new("toml"))
+                                .unwrap_or(false)
+                        })
+                        .map(|e| e.path())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        self.state.config_wizard.set_configs_from_paths(paths);
     }
 
     fn handle_progress(&mut self, _event: TuiEvent) -> std::io::Result<bool> {

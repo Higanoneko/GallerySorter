@@ -3,13 +3,272 @@
 use crate::config::{
     ClassificationRule, Config, EnumOption, FileOperation, MonthFormat, ProcessingMode,
 };
+use crate::tui::event::TuiEvent;
 use crate::tui::labels::{
     bool_label, classification_label, file_operation_label, month_format_label,
     processing_mode_label,
 };
+use crate::tui::state::app::{AppState, reset_to_main_menu};
 use crate::tui::state::input::InputState;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+
+/// 状态层副作用
+///
+/// 转换函数不执行任何 IO，所有副作用以 `Effect` 表达，
+/// 由 `app.rs` 在边缘执行。
+#[derive(Debug, Clone)]
+pub enum Effect {
+    /// 加载指定配置文件（当前行为：加载后初始化表单并进入摘要）
+    LoadConfig(PathBuf),
+    /// 保存配置（携带配置名称）
+    SaveConfig(String),
+    /// 刷新配置列表
+    RefreshConfigs,
+    /// 启动处理（携带配置与配置名称）
+    RunProcessing {
+        config: Box<Config>,
+        config_name: Option<String>,
+    },
+}
+
+/// 向导流程
+///
+/// 取代原先 4 个布尔标志（`skip_confirm_run` / `from_config_select` /
+/// `need_modify_confirm` / `config_saved`），三条流程在类型层面互斥。
+/// `RunFromConfig` 携带“是否需要修改确认”的运行时状态。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WizardFlow {
+    /// 默认状态（等价于原全 false 标志组）
+    #[default]
+    CreateConfig,
+    /// 直接输入参数运行流（填表单 → 摘要 → 不保存配置、直接执行处理）
+    RunDirect,
+    /// 使用已有配置运行流（选择配置 → 可修改 → 确认后执行处理）
+    RunFromConfig { need_modify_confirm: bool },
+}
+
+/// 配置向导转换函数
+///
+/// 纯转换：只修改状态并返回副作用列表，不执行任何 IO。
+/// 行为与 app.rs 原 `handle_config_wizard` 逐分支一致。
+pub fn transition(state: &mut AppState, event: TuiEvent) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let step = state.config_wizard.step.clone();
+
+    match event {
+        TuiEvent::Up => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.input_move_to_start();
+            } else {
+                match step {
+                    ConfigStep::ConfigForm => state.config_wizard.navigate_form_prev(),
+                    ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
+                        state.config_wizard.navigate_prev()
+                    }
+                    _ => {}
+                }
+            }
+        }
+        TuiEvent::Down => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.input_move_to_end();
+            } else {
+                match step {
+                    ConfigStep::ConfigForm => state.config_wizard.navigate_form_next(),
+                    ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
+                        state.config_wizard.navigate_next()
+                    }
+                    _ => {}
+                }
+            }
+        }
+        TuiEvent::Left => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.input_move_left();
+            } else {
+                match step {
+                    ConfigStep::ConfigForm => {
+                        if !state.config_wizard.is_next_selected() {
+                            state.config_wizard.toggle_current_field_prev();
+                        }
+                    }
+                    ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
+                        state.config_wizard.navigate_prev();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        TuiEvent::Right => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.input_move_right();
+            } else {
+                match step {
+                    ConfigStep::ConfigForm => {
+                        if !state.config_wizard.is_next_selected() {
+                            state.config_wizard.toggle_current_field_next();
+                        }
+                    }
+                    ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
+                        state.config_wizard.navigate_next();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        TuiEvent::Enter => match step {
+            ConfigStep::ConfigSelect => {
+                if !state.config_wizard.can_confirm_config_select() {
+                    return effects;
+                }
+
+                state.config_wizard.ensure_selection();
+                let selected = state.config_wizard.selected_value();
+                let selected_path = state.config_wizard.available_configs.get(selected).cloned();
+
+                if let Some(path) = selected_path {
+                    effects.push(Effect::LoadConfig(path));
+                }
+            }
+            ConfigStep::ConfirmRun => {
+                state.config_wizard.ensure_selection();
+                let selected = state.config_wizard.selected_value();
+
+                if state.config_wizard.is_select_config_flow() {
+                    if selected == 0 {
+                        state.config_wizard.flow = WizardFlow::RunFromConfig {
+                            need_modify_confirm: false,
+                        };
+                        state.config_wizard.form_state = ConfigFormState::new();
+                        state.config_wizard.step = ConfigStep::ConfigForm;
+                    } else {
+                        let config = state.config_wizard.build_config();
+                        effects.push(Effect::RunProcessing {
+                            config: Box::new(config),
+                            config_name: Some(state.config_wizard.config_name.clone()),
+                        });
+                    }
+                } else {
+                    // CreateConfig/RunDirect 在确认步骤始终保存配置
+                    effects.push(Effect::SaveConfig(state.config_wizard.config_name.clone()));
+
+                    if selected == 0 {
+                        let config = state.config_wizard.build_config();
+                        effects.push(Effect::RunProcessing {
+                            config: Box::new(config),
+                            config_name: Some(state.config_wizard.config_name.clone()),
+                        });
+                    } else {
+                        reset_to_main_menu(state);
+                    }
+                }
+            }
+            ConfigStep::ConfigForm => {
+                if state.config_wizard.is_in_input_mode() {
+                    state.config_wizard.exit_input_mode_apply();
+                } else if state.config_wizard.is_next_selected() {
+                    if state.config_wizard.validate_form().is_ok() {
+                        state.config_wizard.step = ConfigStep::Summary;
+                    } else {
+                        state.config_wizard.error_message =
+                            state.config_wizard.validate_form().err();
+                    }
+                } else if let Some(field) = state.config_wizard.selected_form_field()
+                    && field.is_input_field()
+                {
+                    state.config_wizard.enter_input_mode_for_field();
+                }
+            }
+            ConfigStep::Summary => {
+                if matches!(state.config_wizard.flow, WizardFlow::RunDirect)
+                    || (state.config_wizard.is_select_config_flow()
+                        && !state.config_wizard.needs_modify_confirm())
+                {
+                    let config = state.config_wizard.build_config();
+                    let config_name = if matches!(state.config_wizard.flow, WizardFlow::RunDirect) {
+                        None
+                    } else {
+                        Some(state.config_wizard.config_name.clone())
+                    };
+                    effects.push(Effect::RunProcessing {
+                        config: Box::new(config),
+                        config_name,
+                    });
+                } else {
+                    state.config_wizard.step = ConfigStep::ConfirmRun;
+                    if state.config_wizard.is_select_config_flow() {
+                        state.config_wizard.set_selected(1);
+                    }
+                    state.config_wizard.ensure_selection();
+                }
+            }
+        },
+        TuiEvent::Char(c) => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.input_insert_char(c);
+            }
+        }
+        TuiEvent::Backspace => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.input_backspace();
+            }
+        }
+        TuiEvent::Delete => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.input_delete();
+            }
+        }
+        TuiEvent::Home => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.input_move_to_start();
+            }
+        }
+        TuiEvent::End => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.input_move_to_end();
+            }
+        }
+        TuiEvent::Escape => {
+            if state.config_wizard.is_in_input_mode() {
+                state.config_wizard.exit_input_mode_cancel();
+            } else {
+                match step {
+                    ConfigStep::ConfirmRun => {
+                        state.config_wizard.step = ConfigStep::Summary;
+                    }
+                    ConfigStep::ConfigForm => {
+                        if state.config_wizard.is_select_config_flow() {
+                            state.config_wizard.step = ConfigStep::ConfigSelect;
+                        } else {
+                            reset_to_main_menu(state);
+                        }
+                    }
+                    ConfigStep::Summary => {
+                        if state.config_wizard.is_select_config_flow()
+                            && state.config_wizard.needs_modify_confirm()
+                        {
+                            state.config_wizard.step = ConfigStep::ConfigSelect;
+                        } else {
+                            state.config_wizard.step = ConfigStep::ConfigForm;
+                        }
+                    }
+                    ConfigStep::ConfigSelect => reset_to_main_menu(state),
+                }
+            }
+        }
+        TuiEvent::Tab if !state.config_wizard.is_in_input_mode() => match step {
+            ConfigStep::ConfigForm => state.config_wizard.navigate_form_next(),
+            ConfigStep::ConfigSelect | ConfigStep::ConfirmRun => {
+                state.config_wizard.navigate_next()
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+
+    effects
+}
 
 /// 枚举选择状态
 #[derive(Debug, Clone, Copy)]
@@ -137,8 +396,6 @@ pub enum ConfigStep {
     /// 配置选择
     #[default]
     ConfigSelect,
-    /// 配置名称
-    ConfigName,
     /// 配置表单
     ConfigForm,
     /// 配置摘要
@@ -152,7 +409,6 @@ impl ConfigStep {
     pub fn title(&self) -> String {
         match self {
             ConfigStep::ConfigSelect => rust_i18n::t!("available_configurations").to_string(),
-            ConfigStep::ConfigName => rust_i18n::t!("enter_config_name").to_string(),
             ConfigStep::ConfigForm => rust_i18n::t!("configuration_form").to_string(),
             ConfigStep::Summary => rust_i18n::t!("configuration_summary").to_string(),
             ConfigStep::ConfirmRun => rust_i18n::t!("proceed_instent").to_string(),
@@ -183,7 +439,6 @@ impl ConfigStep {
     pub fn next(&self, _classification: ClassificationRule) -> Self {
         match self {
             ConfigStep::ConfigSelect => ConfigStep::ConfigForm,
-            ConfigStep::ConfigName => ConfigStep::ConfigForm,
             ConfigStep::ConfigForm => ConfigStep::Summary,
             ConfigStep::Summary => ConfigStep::ConfirmRun,
             ConfigStep::ConfirmRun => ConfigStep::ConfirmRun,
@@ -216,12 +471,14 @@ pub enum FormField {
     Deduplication,
     /// 试运行
     DryRun,
+    /// 统一文件名
+    UnifyFilenames,
 }
 
 impl FormField {
     /// 字段数量
     pub fn count() -> usize {
-        11
+        12
     }
 
     /// 获取全部字段
@@ -238,6 +495,7 @@ impl FormField {
             FormField::FileOperation,
             FormField::Deduplication,
             FormField::DryRun,
+            FormField::UnifyFilenames,
         ]
     }
 
@@ -271,6 +529,7 @@ impl FormField {
             FormField::FileOperation => rust_i18n::t!("field_file_operation").to_string(),
             FormField::Deduplication => rust_i18n::t!("field_deduplication").to_string(),
             FormField::DryRun => rust_i18n::t!("field_dry_run").to_string(),
+            FormField::UnifyFilenames => rust_i18n::t!("field_unify_filenames").to_string(),
         }
     }
 
@@ -294,13 +553,14 @@ impl FormField {
             }
             FormField::Deduplication => bool_label(state.deduplicate.value()).to_string(),
             FormField::DryRun => bool_label(state.dry_run.value()).to_string(),
+            FormField::UnifyFilenames => bool_label(state.unify_filenames.value()).to_string(),
         }
     }
 
     /// 是否可见
     pub fn is_visible(&self, state: &ConfigWizardState) -> bool {
         match self {
-            FormField::ConfigName => !state.skip_confirm_run,
+            FormField::ConfigName => !state.is_run_direct_flow(),
             FormField::MonthFormat => {
                 state.classification.selected() == ClassificationRule::YearMonth
             }
@@ -402,6 +662,8 @@ impl ConfigFormState {
 pub struct ConfigWizardState {
     /// 当前步骤
     pub step: ConfigStep,
+    /// 向导流程
+    pub flow: WizardFlow,
     /// 输入目录
     pub input_dirs: String,
     /// 输出目录
@@ -422,6 +684,8 @@ pub struct ConfigWizardState {
     pub dry_run: BoolSelection,
     /// 按类型分类
     pub classify_by_type: BoolSelection,
+    /// 统一文件名
+    pub unify_filenames: BoolSelection,
     /// 配置名称
     pub config_name: String,
     /// 可用配置列表
@@ -430,16 +694,8 @@ pub struct ConfigWizardState {
     pub selected_config: Option<usize>,
     /// 校验错误
     pub error_message: Option<String>,
-    /// 是否已保存配置
-    pub config_saved: bool,
     /// 保存路径
     pub config_path: Option<PathBuf>,
-    /// 是否跳过确认
-    pub skip_confirm_run: bool,
-    /// 是否来自配置选择
-    pub from_config_select: bool,
-    /// 是否需要提示修改确认
-    pub need_modify_confirm: bool,
     /// 表单状态
     pub form_state: ConfigFormState,
 }
@@ -452,12 +708,27 @@ impl ConfigWizardState {
 
     /// 是否处于创建配置流程
     pub fn is_create_config_flow(&self) -> bool {
-        !self.skip_confirm_run && !self.from_config_select
+        matches!(self.flow, WizardFlow::CreateConfig)
+    }
+
+    /// 是否处于直接输入参数运行流程
+    pub fn is_run_direct_flow(&self) -> bool {
+        matches!(self.flow, WizardFlow::RunDirect)
     }
 
     /// 是否处于配置选择流程
     pub fn is_select_config_flow(&self) -> bool {
-        self.from_config_select
+        matches!(self.flow, WizardFlow::RunFromConfig { .. })
+    }
+
+    /// 使用已有配置流程中是否需要修改确认
+    pub fn needs_modify_confirm(&self) -> bool {
+        matches!(
+            self.flow,
+            WizardFlow::RunFromConfig {
+                need_modify_confirm: true
+            }
+        )
     }
 
     /// 配置选择是否允许确认
@@ -494,6 +765,8 @@ impl ConfigWizardState {
             .select_by_index(if config.dry_run { 1 } else { 0 });
         self.classify_by_type
             .select_by_index(if config.classify_by_type { 1 } else { 0 });
+        self.unify_filenames
+            .select_by_index(if config.unify_filenames { 1 } else { 0 });
         self.config_name = config_path
             .file_stem()
             .map(|os| os.to_string_lossy().to_string())
@@ -527,6 +800,7 @@ impl ConfigWizardState {
             operation: self.operation.selected(),
             deduplicate: self.deduplicate.value(),
             dry_run: self.dry_run.value(),
+            unify_filenames: self.unify_filenames.value(),
             verbose: false,
             ..Default::default()
         }
@@ -536,7 +810,7 @@ impl ConfigWizardState {
     pub fn validate_form(&self) -> Result<(), String> {
         let mut errors = Vec::new();
 
-        if !self.skip_confirm_run {
+        if !self.is_run_direct_flow() {
             if self.config_name.trim().is_empty() {
                 errors.push(rust_i18n::t!("config_name_empty_error").to_string());
             } else if self.config_name.contains('/')
@@ -562,60 +836,9 @@ impl ConfigWizardState {
         }
     }
 
-    /// 保存配置文件
-    pub fn save_config(&mut self) -> Result<PathBuf, String> {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        let config_dir = exe_dir.join("Config");
-
-        std::fs::create_dir_all(&config_dir)
-            .map_err(|e| format!("Failed to create config directory: {}", e))?;
-
-        let config_path = config_dir.join(&self.config_name).with_extension("toml");
-        let config = self.build_config();
-
-        toml::to_string_pretty(&config)
-            .map_err(|e| format!("Failed to serialize config: {}", e))
-            .and_then(|content| {
-                std::fs::write(&config_path, content)
-                    .map_err(|e| format!("Failed to write config file: {}", e))
-            })?;
-
-        self.config_saved = true;
-        self.config_path = Some(config_path.clone());
-
-        Ok(config_path)
-    }
-
-    /// 刷新配置列表
-    pub fn refresh_configs(&mut self) {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let config_dir = exe_dir.join("Config");
-        self.available_configs = if !config_dir.exists() {
-            Vec::new()
-        } else {
-            std::fs::read_dir(&config_dir)
-                .ok()
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .filter(|e| {
-                            e.path()
-                                .extension()
-                                .map(|ext| ext == std::ffi::OsStr::new("toml"))
-                                .unwrap_or(false)
-                        })
-                        .map(|e| e.path())
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+    /// 从外部扫描结果设置可用配置列表（纯状态更新，IO 由 app.rs 执行）
+    pub fn set_configs_from_paths(&mut self, paths: Vec<PathBuf>) {
+        self.available_configs = paths;
 
         if self.available_configs.is_empty() {
             self.selected_config = None;
@@ -739,6 +962,7 @@ impl ConfigWizardState {
             Some(FormField::Deduplication) => self.deduplicate.next(),
             Some(FormField::DryRun) => self.dry_run.next(),
             Some(FormField::ClassifyByType) => self.classify_by_type.next(),
+            Some(FormField::UnifyFilenames) => self.unify_filenames.next(),
             _ => {}
         }
     }
@@ -756,6 +980,7 @@ impl ConfigWizardState {
             Some(FormField::Deduplication) => self.deduplicate.prev(),
             Some(FormField::DryRun) => self.dry_run.prev(),
             Some(FormField::ClassifyByType) => self.classify_by_type.prev(),
+            Some(FormField::UnifyFilenames) => self.unify_filenames.prev(),
             _ => {}
         }
     }
@@ -869,5 +1094,333 @@ impl ConfigWizardState {
     /// 输入光标到行尾
     pub fn input_move_to_end(&mut self) {
         self.form_state.input.move_cursor_to_end();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::state::Screen;
+
+    /// 三条向导流程（对应 4 个布尔标志的既有组合）
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Flow {
+        RunDirect,
+        RunFromConfig,
+        CreateConfig,
+    }
+
+    /// 副作用摘要（只比较种类与配置名有无，不比较完整 Config）
+    #[derive(Debug, Clone, PartialEq)]
+    enum EffectKind {
+        LoadConfig,
+        SaveConfig,
+        RefreshConfigs,
+        RunProcessing { has_name: bool },
+    }
+
+    #[derive(Debug)]
+    struct Expected {
+        step: ConfigStep,
+        effects: Vec<EffectKind>,
+        resets_main_menu: bool,
+    }
+
+    fn state_for(flow: Flow, step: ConfigStep) -> AppState {
+        let wizard_flow = match flow {
+            Flow::RunDirect => WizardFlow::RunDirect,
+            Flow::RunFromConfig => WizardFlow::RunFromConfig {
+                need_modify_confirm: true,
+            },
+            Flow::CreateConfig => WizardFlow::CreateConfig,
+        };
+        AppState {
+            current_screen: Screen::ConfigWizard,
+            config_wizard: ConfigWizardState {
+                step,
+                flow: wizard_flow,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn all_events() -> Vec<TuiEvent> {
+        vec![
+            TuiEvent::Up,
+            TuiEvent::Down,
+            TuiEvent::Left,
+            TuiEvent::Right,
+            TuiEvent::Enter,
+            TuiEvent::Escape,
+            TuiEvent::Tab,
+            TuiEvent::Char('x'),
+            TuiEvent::Backspace,
+            TuiEvent::Delete,
+            TuiEvent::Home,
+            TuiEvent::End,
+        ]
+    }
+
+    fn effect_kinds(effects: &[Effect]) -> Vec<EffectKind> {
+        effects
+            .iter()
+            .map(|effect| match effect {
+                Effect::LoadConfig(_) => EffectKind::LoadConfig,
+                Effect::SaveConfig(_) => EffectKind::SaveConfig,
+                Effect::RefreshConfigs => EffectKind::RefreshConfigs,
+                Effect::RunProcessing { config_name, .. } => EffectKind::RunProcessing {
+                    has_name: config_name.is_some(),
+                },
+            })
+            .collect()
+    }
+
+    /// 转换表：给定（flow 标志组, step, event），断言（step, 副作用, 是否重置主菜单）
+    fn expected_for(flow: Flow, step: ConfigStep, event: TuiEvent) -> Expected {
+        let inert = Expected {
+            step: step.clone(),
+            effects: Vec::new(),
+            resets_main_menu: false,
+        };
+
+        match (&step, event) {
+            (ConfigStep::ConfigSelect, TuiEvent::Escape) => Expected {
+                step: ConfigStep::ConfigSelect,
+                effects: vec![],
+                resets_main_menu: true,
+            },
+            (ConfigStep::ConfigSelect, _) => inert,
+            (ConfigStep::ConfigForm, TuiEvent::Enter) => {
+                // 默认选中第一个可见字段（输入字段）→ 进入输入模式
+                Expected {
+                    step: ConfigStep::ConfigForm,
+                    effects: vec![],
+                    resets_main_menu: false,
+                }
+            }
+            (ConfigStep::ConfigForm, TuiEvent::Escape) => match flow {
+                Flow::RunFromConfig => Expected {
+                    step: ConfigStep::ConfigSelect,
+                    effects: vec![],
+                    resets_main_menu: false,
+                },
+                _ => Expected {
+                    step: ConfigStep::ConfigSelect,
+                    effects: vec![],
+                    resets_main_menu: true,
+                },
+            },
+            (ConfigStep::ConfigForm, _) => inert,
+            (ConfigStep::Summary, TuiEvent::Enter) => match flow {
+                Flow::RunDirect => Expected {
+                    step: ConfigStep::Summary,
+                    effects: vec![EffectKind::RunProcessing { has_name: false }],
+                    resets_main_menu: false,
+                },
+                Flow::RunFromConfig | Flow::CreateConfig => Expected {
+                    step: ConfigStep::ConfirmRun,
+                    effects: vec![],
+                    resets_main_menu: false,
+                },
+            },
+            (ConfigStep::Summary, TuiEvent::Escape) => match flow {
+                Flow::RunFromConfig => Expected {
+                    step: ConfigStep::ConfigSelect,
+                    effects: vec![],
+                    resets_main_menu: false,
+                },
+                _ => Expected {
+                    step: ConfigStep::ConfigForm,
+                    effects: vec![],
+                    resets_main_menu: false,
+                },
+            },
+            (ConfigStep::Summary, _) => inert,
+            (ConfigStep::ConfirmRun, TuiEvent::Enter) => match flow {
+                Flow::RunFromConfig => Expected {
+                    step: ConfigStep::ConfigForm,
+                    effects: vec![],
+                    resets_main_menu: false,
+                },
+                Flow::RunDirect | Flow::CreateConfig => Expected {
+                    step: ConfigStep::ConfirmRun,
+                    effects: vec![
+                        EffectKind::SaveConfig,
+                        EffectKind::RunProcessing { has_name: true },
+                    ],
+                    resets_main_menu: false,
+                },
+            },
+            (ConfigStep::ConfirmRun, TuiEvent::Escape) => Expected {
+                step: ConfigStep::Summary,
+                effects: vec![],
+                resets_main_menu: false,
+            },
+            (ConfigStep::ConfirmRun, _) => inert,
+        }
+    }
+
+    #[test]
+    fn test_transition_table_all_flow_step_event_combinations() {
+        let flows = [Flow::RunDirect, Flow::RunFromConfig, Flow::CreateConfig];
+        let steps = [
+            ConfigStep::ConfigSelect,
+            ConfigStep::ConfigForm,
+            ConfigStep::Summary,
+            ConfigStep::ConfirmRun,
+        ];
+
+        for flow in flows {
+            for step in steps.clone() {
+                for event in all_events() {
+                    let mut state = state_for(flow, step.clone());
+                    let effects = transition(&mut state, event.clone());
+                    let expected = expected_for(flow, step.clone(), event.clone());
+
+                    assert_eq!(
+                        state.config_wizard.step, expected.step,
+                        "flow={flow:?} step={step:?} event={event:?}"
+                    );
+                    assert_eq!(
+                        effect_kinds(&effects),
+                        expected.effects,
+                        "flow={flow:?} step={step:?} event={event:?}"
+                    );
+                    assert_eq!(
+                        state.current_screen == Screen::MainMenu,
+                        expected.resets_main_menu,
+                        "flow={flow:?} step={step:?} event={event:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_config_select_enter_emits_load_config_effect() {
+        let mut state = state_for(Flow::RunFromConfig, ConfigStep::ConfigSelect);
+        state.config_wizard.available_configs = vec![PathBuf::from("C:/configs/album.toml")];
+
+        let effects = transition(&mut state, TuiEvent::Enter);
+
+        assert_eq!(effect_kinds(&effects), vec![EffectKind::LoadConfig]);
+        assert_eq!(state.config_wizard.step, ConfigStep::ConfigSelect);
+    }
+
+    #[test]
+    fn test_run_from_config_summary_modified_confirm_runs_directly() {
+        // 修改确认已完成 → Summary Enter 直接运行
+        let mut state = state_for(Flow::RunFromConfig, ConfigStep::Summary);
+        state.config_wizard.flow = WizardFlow::RunFromConfig {
+            need_modify_confirm: false,
+        };
+        state.config_wizard.config_name = "album".to_string();
+
+        let effects = transition(&mut state, TuiEvent::Enter);
+
+        assert_eq!(
+            effect_kinds(&effects),
+            vec![EffectKind::RunProcessing { has_name: true }]
+        );
+        assert_eq!(state.config_wizard.step, ConfigStep::Summary);
+    }
+
+    #[test]
+    fn test_run_from_config_confirm_run_selected_run_emits_effect() {
+        let mut state = state_for(Flow::RunFromConfig, ConfigStep::ConfirmRun);
+        state.config_wizard.config_name = "album".to_string();
+        state.config_wizard.set_selected(1);
+
+        let effects = transition(&mut state, TuiEvent::Enter);
+
+        assert_eq!(
+            effect_kinds(&effects),
+            vec![EffectKind::RunProcessing { has_name: true }]
+        );
+        assert_eq!(state.config_wizard.step, ConfigStep::ConfirmRun);
+    }
+
+    #[test]
+    fn test_create_config_confirm_run_decline_resets_to_main_menu() {
+        let mut state = state_for(Flow::CreateConfig, ConfigStep::ConfirmRun);
+        state.config_wizard.config_name = "album".to_string();
+        state.config_wizard.set_selected(1);
+
+        let effects = transition(&mut state, TuiEvent::Enter);
+
+        assert_eq!(effect_kinds(&effects), vec![EffectKind::SaveConfig]);
+        assert_eq!(state.current_screen, Screen::MainMenu);
+    }
+
+    #[test]
+    fn test_config_form_next_validates_and_advances_to_summary() {
+        let mut state = state_for(Flow::CreateConfig, ConfigStep::ConfigForm);
+        state.config_wizard.config_name = "album".to_string();
+        state.config_wizard.input_dirs = "D:/photos".to_string();
+        state.config_wizard.output_dir = "D:/sorted".to_string();
+        // 将选中索引移到“下一步”伪字段（可见字段 11 个 → 索引 11）
+        state.config_wizard.form_state.selected_field = 12;
+        assert!(state.config_wizard.is_next_selected());
+
+        let effects = transition(&mut state, TuiEvent::Enter);
+
+        assert_eq!(state.config_wizard.step, ConfigStep::Summary);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn test_config_form_next_invalid_sets_error_message() {
+        let mut state = state_for(Flow::CreateConfig, ConfigStep::ConfigForm);
+        state.config_wizard.form_state.selected_field = 12;
+
+        let effects = transition(&mut state, TuiEvent::Enter);
+
+        assert_eq!(state.config_wizard.step, ConfigStep::ConfigForm);
+        assert!(state.config_wizard.error_message.is_some());
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn test_config_form_input_mode_interactions() {
+        let mut state = state_for(Flow::RunDirect, ConfigStep::ConfigForm);
+
+        // Enter 进入输入模式
+        transition(&mut state, TuiEvent::Enter);
+        assert!(state.config_wizard.is_in_input_mode());
+
+        transition(&mut state, TuiEvent::Char('h'));
+        transition(&mut state, TuiEvent::Char('i'));
+        assert_eq!(state.config_wizard.input_buffer(), "hi");
+        assert_eq!(state.config_wizard.input_cursor(), 2);
+
+        transition(&mut state, TuiEvent::Home);
+        assert_eq!(state.config_wizard.input_cursor(), 0);
+        transition(&mut state, TuiEvent::End);
+        assert_eq!(state.config_wizard.input_cursor(), 2);
+
+        transition(&mut state, TuiEvent::Backspace);
+        assert_eq!(state.config_wizard.input_buffer(), "h");
+        assert_eq!(state.config_wizard.input_cursor(), 1);
+
+        transition(&mut state, TuiEvent::Char('e'));
+        assert_eq!(state.config_wizard.input_buffer(), "he");
+        transition(&mut state, TuiEvent::Left);
+        assert_eq!(state.config_wizard.input_cursor(), 1);
+        transition(&mut state, TuiEvent::Delete);
+        assert_eq!(state.config_wizard.input_buffer(), "h");
+
+        // Escape 取消输入，不应用
+        transition(&mut state, TuiEvent::Escape);
+        assert!(!state.config_wizard.is_in_input_mode());
+        assert_eq!(state.config_wizard.input_dirs, "");
+
+        // 再次进入并应用
+        transition(&mut state, TuiEvent::Enter);
+        assert!(state.config_wizard.is_in_input_mode());
+        transition(&mut state, TuiEvent::Char('D'));
+        transition(&mut state, TuiEvent::Enter);
+        assert!(!state.config_wizard.is_in_input_mode());
+        assert_eq!(state.config_wizard.input_dirs, "D");
     }
 }

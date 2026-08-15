@@ -20,16 +20,19 @@ pub mod hash;
 pub mod i18n;
 pub mod os;
 pub mod process;
+pub mod rename;
 pub mod state;
 pub mod time;
 pub mod tui;
 
 pub use cli::Cli;
+pub use cli::should_run_interactive;
 pub use config::{
     ClassificationRule, Config, ConfigError, FileOperation, FileType, MonthFormat, ProcessingMode,
 };
 pub use error::{Error, Result};
 pub use i18n::init_locale;
 pub use process::Processor;
+pub use rename::{RenameResult, RenameStats, RenameStatus, Renamer};
 pub use state::{IncrementalWatermark, ProcessingState};
-pub use tui::{TuiApp, TuiResult, display_summary, should_run_interactive};
+pub use tui::{TuiApp, TuiResult};

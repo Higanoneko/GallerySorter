@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{Level, debug, error, info, span, warn};
 use walkdir::WalkDir;
@@ -94,6 +94,8 @@ pub enum ProcessingStatus {
     Failed,
     /// Dry run - would have processed
     DryRun,
+    /// 取消时未开始处理（ADR-0003：保存到中断点，不回滚）
+    Cancelled,
 }
 
 /// Processing statistics
@@ -141,11 +143,20 @@ pub struct Processor {
     state: ProcessingState,
     watermark: Option<IncrementalWatermark>,
     stats: Arc<ProcessingStats>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl Processor {
     /// Create a new processor with the given configuration
     pub fn new(config: Config) -> Result<Self> {
+        Self::new_with_cancel(config, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Create a new processor with the given configuration and cancel flag
+    ///
+    /// 取消标志由调用方（TUI/CLI）持有并置位；检查点位于
+    /// Phase 1/2/3 边界以及每文件处理前（ADR-0003）。
+    pub fn new_with_cancel(config: Config, cancel: Arc<AtomicBool>) -> Result<Self> {
         // Configure Rayon thread pool
         if config.threads > 0 {
             rayon::ThreadPoolBuilder::new()
@@ -242,7 +253,17 @@ impl Processor {
             state,
             watermark,
             stats: Arc::new(ProcessingStats::new()),
+            cancel,
         })
+    }
+
+    /// 是否已请求取消
+    pub fn was_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     /// Get the total number of files that would be processed
@@ -334,12 +355,23 @@ impl Processor {
             return Ok(Vec::new());
         }
 
+        // 取消检查点：Phase 1（哈希）边界
+        if self.is_cancelled() {
+            info!(cancelled = true, "Cancelled before hashing");
+            return Ok(Vec::new());
+        }
+
+        let cancel = self.cancel.clone();
+
         // Phase 1: Compute hashes for all files in parallel to determine duplicates
         info!("Computing file hashes for deduplication...");
         let file_hashes: Vec<(PathBuf, Option<u64>)> = if config.deduplicate {
             files
                 .par_iter()
                 .map(|path| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return (path.clone(), None);
+                    }
                     let hash = compute_file_hash(path, config.large_file_threshold).ok();
                     (path.clone(), hash)
                 })
@@ -347,6 +379,12 @@ impl Processor {
         } else {
             files.iter().map(|p| (p.clone(), None)).collect()
         };
+
+        // 取消检查点：Phase 2（去重）边界
+        if self.is_cancelled() {
+            info!(cancelled = true, "Cancelled after hashing");
+            return Ok(Vec::new());
+        }
 
         // Phase 2: Select best file for each unique hash (cleanest filename wins)
         // Group files by hash
@@ -401,6 +439,12 @@ impl Processor {
             );
         }
 
+        // 取消检查点：Phase 3（处理）边界
+        if self.is_cancelled() {
+            info!(cancelled = true, "Cancelled before processing files");
+            return Ok(Vec::new());
+        }
+
         // Phase 3: Process files
         info!("Processing files...");
 
@@ -422,6 +466,18 @@ impl Processor {
             .par_iter()
             .map(|file_path| {
                 let _file_span = span!(Level::DEBUG, "process_file", ?file_path).entered();
+
+                // 每文件处理前检查取消标志（ADR-0003 检查点语义）
+                if cancel.load(Ordering::Relaxed) {
+                    debug!(?file_path, "File not processed due to cancellation");
+                    return FileResult {
+                        source: file_path.clone(),
+                        destination: None,
+                        time_info: None,
+                        status: ProcessingStatus::Cancelled,
+                        error: None,
+                    };
+                }
 
                 // Check if this is a duplicate that should be skipped
                 if !files_to_process.contains(file_path) {
@@ -468,6 +524,14 @@ impl Processor {
             .into_inner()
             .unwrap();
 
+        if self.was_cancelled() {
+            info!(
+                cancelled = true,
+                processed = self.stats.processed.load(Ordering::Relaxed),
+                "Processing cancelled, state saved to interruption point"
+            );
+        }
+
         // Save state if incremental processing is enabled
         if self.config.processing_mode == ProcessingMode::Incremental && !self.config.dry_run {
             self.state.save(&self.config.get_state_file())?;
@@ -486,71 +550,7 @@ impl Processor {
     /// Files are sorted by filename priority score (cleanest filenames first)
     /// to ensure proper duplicate retention strategy
     fn collect_files(&self) -> Result<Vec<PathBuf>> {
-        let mut files = Vec::new();
-
-        for input_dir in &self.config.input_dirs {
-            if !input_dir.exists() {
-                warn!(?input_dir, "Input directory does not exist, skipping");
-                continue;
-            }
-
-            for entry in WalkDir::new(input_dir)
-                .follow_links(true)
-                .into_iter()
-                .filter_entry(|e| !self.is_excluded_dir(e.path()))
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if path.is_file()
-                    && let Some(ext) = path.extension().and_then(|e| e.to_str())
-                    && self.config.is_supported(ext)
-                {
-                    files.push(path.to_path_buf());
-                }
-            }
-        }
-
-        // Sort files by priority score (lowest score = cleanest filename = processed first)
-        // This ensures that when duplicates are detected, the cleanest filename is kept
-        files.sort_by_cached_key(|path| filename_priority_score(path));
-
-        debug!(
-            "Sorted {} files by filename priority (cleanest first)",
-            files.len()
-        );
-
-        Ok(files)
-    }
-
-    /// Check if a path should be excluded based on exclude_dirs configuration
-    fn is_excluded_dir(&self, path: &Path) -> bool {
-        if self.config.exclude_dirs.is_empty() {
-            return false;
-        }
-
-        for exclude in &self.config.exclude_dirs {
-            // Check if it's an absolute path match
-            if exclude.is_absolute() {
-                if path.starts_with(exclude) {
-                    debug!(?path, ?exclude, "Excluding directory (absolute path match)");
-                    return true;
-                }
-            } else {
-                // Check if any component of the path matches the exclude pattern
-                if let Some(exclude_name) = exclude.file_name() {
-                    for component in path.components() {
-                        if let std::path::Component::Normal(name) = component
-                            && name == exclude_name
-                        {
-                            debug!(?path, ?exclude, "Excluding directory (folder name match)");
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        false
+        collect_media_files(&self.config)
     }
 
     /// Scan target directory for existing file hashes (for Supplement mode)
@@ -1019,8 +1019,18 @@ fn build_base_destination_path(
 }
 
 /// Resolve filename conflicts by adding a numeric suffix
-fn resolve_filename_conflict(mut path: PathBuf) -> Result<PathBuf> {
-    if !path.exists() {
+fn resolve_filename_conflict(path: PathBuf) -> Result<PathBuf> {
+    resolve_filename_conflict_with(path, &HashSet::new())
+}
+
+/// 与 [`resolve_filename_conflict`] 相同，但额外考虑本次运行中已占用的目标路径。
+///
+/// 用于文件名统一化等需要在“目标尚未落盘”时预占路径的场景（如试运行）。
+pub(crate) fn resolve_filename_conflict_with(
+    mut path: PathBuf,
+    occupied: &HashSet<PathBuf>,
+) -> Result<PathBuf> {
+    if !path.exists() && !occupied.contains(&path) {
         return Ok(path);
     }
 
@@ -1041,12 +1051,83 @@ fn resolve_filename_conflict(mut path: PathBuf) -> Result<PathBuf> {
     for i in 1..10000 {
         let new_name = format!("{}_{}{}", stem, i, extension);
         path = parent.join(new_name);
-        if !path.exists() {
+        if !path.exists() && !occupied.contains(&path) {
             return Ok(path);
         }
     }
 
     Err(Error::Config("Could not resolve filename conflict".into()))
+}
+
+/// 收集所有受支持媒体文件（递归扫描 + 排除目录 + 按文件名优先级排序）。
+///
+/// 供处理流水线与文件名统一化等入口复用的扫描逻辑。
+pub fn collect_media_files(config: &Config) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+
+    for input_dir in &config.input_dirs {
+        if !input_dir.exists() {
+            warn!(?input_dir, "Input directory does not exist, skipping");
+            continue;
+        }
+
+        for entry in WalkDir::new(input_dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_entry(|e| !is_excluded_dir(e.path(), config))
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.is_file()
+                && let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && config.is_supported(ext)
+            {
+                files.push(path.to_path_buf());
+            }
+        }
+    }
+
+    // Sort files by priority score (lowest score = cleanest filename = processed first)
+    // This ensures that when duplicates are detected, the cleanest filename is kept
+    files.sort_by_cached_key(|path| filename_priority_score(path));
+
+    debug!(
+        "Sorted {} files by filename priority (cleanest first)",
+        files.len()
+    );
+
+    Ok(files)
+}
+
+/// Check if a path should be excluded based on exclude_dirs configuration
+fn is_excluded_dir(path: &Path, config: &Config) -> bool {
+    if config.exclude_dirs.is_empty() {
+        return false;
+    }
+
+    for exclude in &config.exclude_dirs {
+        // Check if it's an absolute path match
+        if exclude.is_absolute() {
+            if path.starts_with(exclude) {
+                debug!(?path, ?exclude, "Excluding directory (absolute path match)");
+                return true;
+            }
+        } else {
+            // Check if any component of the path matches the exclude pattern
+            if let Some(exclude_name) = exclude.file_name() {
+                for component in path.components() {
+                    if let std::path::Component::Normal(name) = component
+                        && name == exclude_name
+                    {
+                        debug!(?path, ?exclude, "Excluding directory (folder name match)");
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Perform the actual file operation (copy, move, symlink, hardlink)
@@ -1118,6 +1199,49 @@ fn copy_file(source: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+
+    fn write_media_file(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, format!("content-{}", name)).unwrap();
+        path
+    }
+
+    fn incremental_config(input: &Path, output: &Path) -> Config {
+        Config {
+            input_dirs: vec![input.to_path_buf()],
+            output_dir: output.to_path_buf(),
+            processing_mode: ProcessingMode::Incremental,
+            operation: FileOperation::Copy,
+            threads: 1,
+            ..Default::default()
+        }
+    }
+
+    /// 递归收集输出目录（相对路径, 内容哈希）
+    fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<String, u64> {
+        let mut map = std::collections::BTreeMap::new();
+        for entry in WalkDir::new(root) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() {
+                let rel = entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .display()
+                    .to_string();
+                // 状态/水位线文件单独断言，不参与目录树对比
+                if rel.starts_with(".gallery_sorter_") {
+                    continue;
+                }
+                let hash = compute_file_hash(entry.path(), u64::MAX).unwrap_or(0);
+                map.insert(rel, hash);
+            }
+        }
+        map
+    }
 
     #[test]
     fn test_processing_stats() {
@@ -1132,6 +1256,161 @@ mod tests {
         assert!(summary.contains("Skipped: 2"));
         assert!(summary.contains("Duplicates: 1"));
         assert!(summary.contains("Failed: 1"));
+    }
+
+    #[test]
+    fn test_cancel_before_run_returns_empty_and_saves_nothing() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        write_media_file(&input, "IMG_20250101_000001.jpg");
+        write_media_file(&input, "IMG_20250101_000002.jpg");
+
+        let config = incremental_config(&input, &output);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut processor = Processor::new_with_cancel(config.clone(), cancel).unwrap();
+
+        let results = processor.run().unwrap();
+
+        assert!(processor.was_cancelled());
+        assert!(results.is_empty());
+        assert!(!config.get_state_file().exists());
+    }
+
+    #[test]
+    fn test_cancel_during_run_saves_state_to_interruption_point() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+
+        for i in 1..=20 {
+            write_media_file(&input, &format!("IMG_20250201_{:06}.jpg", i));
+        }
+
+        let config = incremental_config(&input, &output);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut processor = Processor::new_with_cancel(config.clone(), cancel.clone()).unwrap();
+        let stats = processor.stats_arc();
+
+        // 处理启动后（有文件已处理）置位取消标志
+        let watcher_stats = stats.clone();
+        let watcher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if watcher_stats.processed.load(Ordering::Relaxed) > 0 {
+                    cancel.store(true, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let results = processor.run().unwrap();
+        watcher.join().unwrap();
+
+        let processed = stats.processed.load(Ordering::Relaxed);
+        assert!(processor.was_cancelled());
+        assert!(processed >= 1, "at least one file should be processed");
+
+        // 取消后结果只包含已处理到中断点的文件
+        let success_count = results
+            .iter()
+            .filter(|r| r.status == ProcessingStatus::Success)
+            .count();
+        assert_eq!(success_count, processed);
+
+        // ProcessingState 保存到中断点
+        let state = ProcessingState::load(&config.get_state_file()).unwrap();
+        assert_eq!(state.file_count(), processed);
+
+        // 水位线更新到已处理的最新文件
+        let watermark = IncrementalWatermark::load(&config.output_dir).unwrap();
+        assert!(
+            watermark.is_some(),
+            "watermark should be saved after processing"
+        );
+    }
+
+    #[test]
+    fn test_cancel_then_incremental_resume_equals_full_run() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output_resume = dir.path().join("output_resume");
+        let output_full = dir.path().join("output_full");
+        fs::create_dir_all(&input).unwrap();
+
+        // 12 个文件：优先级（文件名长度）递增 == 时间戳递增，
+        // 保证取消后剩余文件都新于水位线（ADR-0003 验收基准）
+        for i in 1..=12 {
+            let name = format!("{}IMG_20240101_{:06}.jpg", "x".repeat(i - 1), i);
+            let content = vec![i as u8; 2 * 1024 * 1024];
+            fs::write(input.join(&name), content).unwrap();
+        }
+
+        // 第一次运行：处理中取消
+        let config = incremental_config(&input, &output_resume);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut processor = Processor::new_with_cancel(config.clone(), cancel.clone()).unwrap();
+        let stats = processor.stats_arc();
+        let watcher_stats = stats.clone();
+        let watcher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if watcher_stats.processed.load(Ordering::Relaxed) >= 3 {
+                    cancel.store(true, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let results = processor.run().unwrap();
+        watcher.join().unwrap();
+
+        let processed_first = stats.processed.load(Ordering::Relaxed);
+        assert!(processor.was_cancelled());
+        assert!((3..12).contains(&processed_first));
+        assert!(
+            results
+                .iter()
+                .any(|r| r.status == ProcessingStatus::Cancelled)
+        );
+
+        // 第二次运行：增量续跑（同一配置、全新 Processor）
+        Processor::new_with_cancel(config.clone(), Arc::new(AtomicBool::new(false)))
+            .unwrap()
+            .run()
+            .unwrap();
+
+        // 对照组：完整一次运行（同输入、全新输出）
+        let full_config = incremental_config(&input, &output_full);
+        Processor::new_with_cancel(full_config.clone(), Arc::new(AtomicBool::new(false)))
+            .unwrap()
+            .run()
+            .unwrap();
+
+        // 目录结构与内容哈希一致
+        assert_eq!(snapshot_tree(&output_resume), snapshot_tree(&output_full));
+
+        // 状态文件记录数一致
+        let resume_state = ProcessingState::load(&config.get_state_file()).unwrap();
+        let full_state = ProcessingState::load(&full_config.get_state_file()).unwrap();
+        assert_eq!(resume_state.file_count(), full_state.file_count());
+        assert_eq!(resume_state.file_count(), 12);
+
+        // 水位线（过滤语义相关字段）一致
+        let resume_wm = IncrementalWatermark::load(&output_resume)
+            .unwrap()
+            .expect("resume watermark should exist");
+        let full_wm = IncrementalWatermark::load(&output_full)
+            .unwrap()
+            .expect("full watermark should exist");
+        assert_eq!(resume_wm.newest_file_path, full_wm.newest_file_path);
+        assert_eq!(resume_wm.newest_timestamp, full_wm.newest_timestamp);
+        assert_eq!(resume_wm.newest_hash, full_wm.newest_hash);
     }
 
     #[test]
@@ -1205,5 +1484,27 @@ mod tests {
             files[1].file_name().unwrap().to_str().unwrap(),
             "IMG_20251006_180527.jpg"
         );
+    }
+
+    #[test]
+    fn test_resolve_filename_conflict_with_occupied_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("20240115_143000.jpg");
+
+        // 目标尚不存在但已被本次运行占用 → 追加 _1 后缀
+        let mut occupied = HashSet::new();
+        occupied.insert(target.clone());
+        let resolved = resolve_filename_conflict_with(target.clone(), &occupied).unwrap();
+        assert_eq!(resolved.file_name().unwrap(), "20240115_143000_1.jpg");
+
+        // 目标不存在且未占用 → 原样返回
+        occupied.clear();
+        let resolved = resolve_filename_conflict_with(target.clone(), &occupied).unwrap();
+        assert_eq!(resolved, target);
+
+        // 目标已存在于磁盘 → 追加 _1 后缀
+        fs::write(&target, "occupied on disk").unwrap();
+        let resolved = resolve_filename_conflict_with(target.clone(), &occupied).unwrap();
+        assert_eq!(resolved.file_name().unwrap(), "20240115_143000_1.jpg");
     }
 }

@@ -290,6 +290,14 @@ pub struct Config {
     /// Dry run mode - don't actually move/copy files
     pub dry_run: bool,
 
+    /// Unify filenames based on EXIF / FFprobe metadata (rename in place)
+    #[serde(default)]
+    pub unify_filenames: bool,
+
+    /// Output file for the list of files left unmodified (rename mode)
+    #[serde(default)]
+    pub unmodified_list_file: Option<PathBuf>,
+
     /// Verbose output
     pub verbose: bool,
 
@@ -319,6 +327,8 @@ impl Default for Config {
             threads: 0,                              // Auto-detect
             large_file_threshold: 100 * 1024 * 1024, // 100MB
             dry_run: false,
+            unify_filenames: false,
+            unmodified_list_file: None,
             verbose: false,
             image_extensions: vec![
                 "jpg".into(),
@@ -424,6 +434,13 @@ impl Config {
             .unwrap_or_else(|| self.output_dir.join(".gallery_sorter_state.json"))
     }
 
+    /// Get the unmodified files list path, using default if not specified
+    pub fn get_unmodified_list_file(&self) -> PathBuf {
+        self.unmodified_list_file
+            .clone()
+            .unwrap_or_else(|| self.output_dir.join("unmodified_files.txt"))
+    }
+
     /// Load configuration from a TOML file
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -526,6 +543,15 @@ large_file_threshold = 104857600
 
 # Dry run mode - show what would be done without actually doing it
 dry_run = false
+
+# Unify filenames based on EXIF / FFprobe metadata (rename files in place)
+# Files without EXIF/FFprobe metadata are left unchanged and listed in
+# unmodified_files.txt under the output directory.
+unify_filenames = false
+
+# Custom path for the unmodified files list (rename mode)
+# Default: <output_dir>/unmodified_files.txt
+# unmodified_list_file = "D:/Reports/unmodified_files.txt"
 
 # Verbose output - show detailed processing information
 verbose = false
