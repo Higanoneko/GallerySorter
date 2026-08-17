@@ -1,8 +1,11 @@
 //! 文件名统一化（Rename）模块
 //!
 //! 基于 EXIF（图片）/ FFprobe（视频）元数据把文件名统一为
-//! `YYYYMMDD_HHMMSS.ext`。没有可解析元数据的文件保持原名，
-//! 可通过 [`write_unmodified_list`] 把这类文件输出到列表文件。
+//! `MVIMG_/IMG_/VID_ + YYYYMMDD_HHMMSS.ext` 的标准相机命名。
+//! CLI/TUI 归档流水线在构建目标路径时直接使用这里的命名规则；
+//! [`Renamer`] 保留为库层面的“原地统一”工具，供不需要归档的调用方使用。
+//! 没有可解析元数据的文件保持原名，可通过 [`write_unmodified_list`] /
+//! [`write_unmodified_paths`] 把这类文件输出到列表文件。
 
 use crate::config::Config;
 use crate::error::Result;
@@ -10,12 +13,151 @@ use crate::process::{collect_media_files, resolve_filename_conflict_with};
 use crate::time::extract_metadata_time;
 use chrono::NaiveDateTime;
 use rayon::prelude::*;
+use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tracing::{Level, debug, error, info, span};
+
+/// 标准相机命名模式：`<MVIMG|IMG|VID>_<YYYYMMDD>_<HHMMSS>`，其后任意内容均视为标准名称
+static STANDARD_NAME_PATTERN: OnceLock<std::result::Result<Regex, regex::Error>> = OnceLock::new();
+
+/// 判断文件名是否为标准类型名称（不区分大小写）。
+///
+/// 只要文件名以 `<标准开头>_<年月日>_<时分秒>` 开头，无论后面接什么
+/// （如 `_HDR`、`_1`、`-edited`）都视为标准名称。
+/// 注意：此处的保留集合（MVIMG/IMG/VID）按需求刻意比
+/// `time/filename.rs` 中解析文件名时间的相机前缀集合更窄，
+/// 两者语义不同，不要合并。
+pub fn is_standard_name(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    // 模式来自编译期常量；初始化失败（如正则语法兼容性问题）时保守回退为“非标准”，
+    // 避免库代码 panic（AGENTS.md：库代码不得 unwrap/expect）
+    match STANDARD_NAME_PATTERN.get_or_init(|| Regex::new(r"(?i)^(?:MVIMG|IMG|VID)_\d{8}_\d{6}")) {
+        Ok(pattern) => pattern.is_match(stem),
+        Err(e) => {
+            debug!(error = %e, "Failed to initialize standard-name pattern");
+            false
+        }
+    }
+}
+
+/// 判断文件是否为动态照片（Motion Photo）。
+///
+/// 优先依据文件名 `MVIMG_` 前缀（Samsung 等相机标准命名）；
+/// 对 JPEG 文件再扫描 APP1/XMP 段中的常见 Motion Photo 标记
+/// （`MicroVideoOffset` / `MicroVideoVersion` / `MotionPhoto` 等），
+/// 覆盖 Google Pixel 等不叫 `MVIMG_` 的动态照片。
+pub fn is_dynamic_photo(path: &Path) -> bool {
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        && let Some(head) = stem.get(..6)
+        && head.eq_ignore_ascii_case("mvimg_")
+    {
+        return true;
+    }
+
+    jpeg_has_motion_photo_marker(path)
+}
+
+/// 计算文件统一化时的标准前缀：
+/// 视频 → `VID`；动态照片 → `MVIMG`；照片与 RAW → `IMG`。
+pub fn standard_name_prefix(source: &Path, config: &Config) -> &'static str {
+    let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if config.is_video(ext) {
+        "VID"
+    } else if is_dynamic_photo(source) {
+        "MVIMG"
+    } else {
+        "IMG"
+    }
+}
+
+/// JPEG APP1/XMP 段中常见的 Motion Photo 标记（小写关键字）
+const MOTION_PHOTO_MARKERS: &[&str] = &[
+    "microvideooffset",
+    "microvideoversion",
+    "microvideopresentationtimestampus",
+    "motionphoto",
+];
+
+/// 扫描 JPEG 的 APP1/XMP 段，检查是否包含动态照片标记。
+///
+/// 仅扫描 `SOS`（图像扫描数据）之前的元数据段，避免误读压缩后的像素数据。
+fn jpeg_has_motion_photo_marker(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+
+    // JPEG 必须以 SOI 开头
+    let mut soi = [0u8; 2];
+    if reader.read_exact(&mut soi).is_err() || soi != [0xFF, 0xD8] {
+        return false;
+    }
+
+    loop {
+        // 丢弃非 0xFF 字节，找到下一个标记前缀
+        let mut discarded = Vec::new();
+        if reader.read_until(0xFF, &mut discarded).is_err() {
+            return false;
+        }
+
+        // 读取标记码（跳过连续的 0xFF 填充字节）
+        let code = loop {
+            let mut byte = [0u8; 1];
+            if reader.read_exact(&mut byte).is_err() {
+                return false;
+            }
+            if byte[0] != 0xFF {
+                break byte[0];
+            }
+        };
+
+        // 独立标记：无长度字段
+        match code {
+            0x00 | 0x01 | 0xD0..=0xD7 => continue,
+            // SOI 出现在文件中间属于异常；EOI / SOS 表示元数据段结束
+            0xD8..=0xDA => return false,
+            _ => {}
+        }
+
+        let mut len_buf = [0u8; 2];
+        if reader.read_exact(&mut len_buf).is_err() {
+            return false;
+        }
+        let seg_len = u16::from_be_bytes(len_buf) as usize;
+        if seg_len < 2 {
+            return false;
+        }
+
+        let mut segment = vec![0u8; seg_len - 2];
+        if reader.read_exact(&mut segment).is_err() {
+            return false;
+        }
+
+        // APP1 + XMP 标识
+        const XMP_ID: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+        if code == 0xE1
+            && let Some(content) = segment.strip_prefix(XMP_ID)
+            && has_motion_photo_marker(content)
+        {
+            return true;
+        }
+    }
+}
+
+/// 在 XMP 内容中查找 Motion Photo 标记（大小写不敏感）
+fn has_motion_photo_marker(content: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(content).to_ascii_lowercase();
+    MOTION_PHOTO_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
 
 /// 单个文件的统一化结果
 #[derive(Debug, Clone)]
@@ -37,6 +179,8 @@ pub enum RenameStatus {
     Renamed,
     /// 试运行：本应重命名但未实际修改
     DryRun,
+    /// 标准类型名称（MVIMG_/IMG_/VID_ 开头），按选项跳过处理
+    Preserved,
     /// 文件名已是统一格式，无需修改
     AlreadyUnified,
     /// 无 EXIF / FFprobe 元数据，保持原名
@@ -54,6 +198,7 @@ pub struct RenameStats {
     /// 已处理（重命名 / 已统一 / 无元数据 / 失败），用于进度显示
     pub handled: AtomicUsize,
     pub renamed: AtomicUsize,
+    pub preserved: AtomicUsize,
     pub already_unified: AtomicUsize,
     pub no_metadata: AtomicUsize,
     pub failed: AtomicUsize,
@@ -65,6 +210,7 @@ impl Clone for RenameStats {
             total_files: AtomicUsize::new(self.total_files.load(Ordering::Relaxed)),
             handled: AtomicUsize::new(self.handled.load(Ordering::Relaxed)),
             renamed: AtomicUsize::new(self.renamed.load(Ordering::Relaxed)),
+            preserved: AtomicUsize::new(self.preserved.load(Ordering::Relaxed)),
             already_unified: AtomicUsize::new(self.already_unified.load(Ordering::Relaxed)),
             no_metadata: AtomicUsize::new(self.no_metadata.load(Ordering::Relaxed)),
             failed: AtomicUsize::new(self.failed.load(Ordering::Relaxed)),
@@ -79,9 +225,10 @@ impl RenameStats {
 
     pub fn summary(&self) -> String {
         format!(
-            "Total: {}, Renamed: {}, Already unified: {}, No metadata: {}, Failed: {}",
+            "Total: {}, Renamed: {}, Preserved: {}, Already unified: {}, No metadata: {}, Failed: {}",
             self.total_files.load(Ordering::Relaxed),
             self.renamed.load(Ordering::Relaxed),
+            self.preserved.load(Ordering::Relaxed),
             self.already_unified.load(Ordering::Relaxed),
             self.no_metadata.load(Ordering::Relaxed),
             self.failed.load(Ordering::Relaxed)
@@ -89,9 +236,14 @@ impl RenameStats {
     }
 }
 
-/// 构建统一文件名：`YYYYMMDD_HHMMSS` + 原扩展名（保留扩展名大小写）
-pub fn build_unified_filename(source: &Path, timestamp: &NaiveDateTime) -> PathBuf {
-    let stem = timestamp.format("%Y%m%d_%H%M%S").to_string();
+/// 构建标准统一文件名：`<MVIMG|IMG|VID>_YYYYMMDD_HHMMSS` + 原扩展名（保留扩展名大小写）
+pub fn build_unified_filename(
+    source: &Path,
+    timestamp: &NaiveDateTime,
+    config: &Config,
+) -> PathBuf {
+    let prefix = standard_name_prefix(source, config);
+    let stem = format!("{}_{}", prefix, timestamp.format("%Y%m%d_%H%M%S"));
     let file_name = match source.extension() {
         Some(ext) => format!("{}.{}", stem, ext.to_string_lossy()),
         None => stem,
@@ -99,21 +251,29 @@ pub fn build_unified_filename(source: &Path, timestamp: &NaiveDateTime) -> PathB
     source.with_file_name(file_name)
 }
 
-/// 判断文件当前是否已是统一文件名（与目标完全一致）
-pub fn is_already_unified(source: &Path, timestamp: &NaiveDateTime) -> bool {
-    build_unified_filename(source, timestamp).as_path() == source
+/// 判断文件当前是否已是标准统一文件名（与目标完全一致）
+pub fn is_already_unified(source: &Path, timestamp: &NaiveDateTime, config: &Config) -> bool {
+    build_unified_filename(source, timestamp, config).as_path() == source
 }
 
 /// 把未修改（无元数据或重命名失败）的文件路径写入列表文件（原子写：tmp + rename）。
 ///
 /// 返回写入的文件数量；没有未修改文件时不创建文件。
 pub fn write_unmodified_list(path: &Path, results: &[RenameResult]) -> Result<usize> {
-    let entries: Vec<String> = results
+    let entries: Vec<PathBuf> = results
         .iter()
         .filter(|r| matches!(r.status, RenameStatus::NoMetadata | RenameStatus::Failed))
-        .map(|r| r.source.display().to_string())
+        .map(|r| r.source.clone())
         .collect();
 
+    write_unmodified_paths(path, &entries)
+}
+
+/// 把未修改文件的路径写入列表文件（原子写：tmp + rename）。
+///
+/// 供归档流水线（Processor）与文件名统一化器共用；
+/// 返回写入的文件数量；没有未修改文件时不创建文件。
+pub fn write_unmodified_paths(path: &Path, entries: &[PathBuf]) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
@@ -124,8 +284,8 @@ pub fn write_unmodified_list(path: &Path, results: &[RenameResult]) -> Result<us
 
     let temp_path = PathBuf::from(format!("{}.tmp", path.display()));
     let mut content = String::new();
-    for entry in &entries {
-        content.push_str(entry);
+    for entry in entries {
+        content.push_str(&entry.display().to_string());
         content.push('\n');
     }
 
@@ -148,6 +308,7 @@ pub struct Renamer {
 /// 单个文件在并行提取阶段的规划动作（不修改磁盘）
 enum PlannedAction {
     Rename(PathBuf),
+    Preserved,
     AlreadyUnified,
     NoMetadata,
     Cancelled,
@@ -221,9 +382,13 @@ impl Renamer {
                     return (path.clone(), PlannedAction::Cancelled);
                 }
 
+                if config.preserve_standard_names && is_standard_name(path) {
+                    return (path.clone(), PlannedAction::Preserved);
+                }
+
                 match extract_metadata_time(path, &config) {
                     Ok(time) => {
-                        let target = build_unified_filename(path, &time.timestamp);
+                        let target = build_unified_filename(path, &time.timestamp, &config);
                         if target.as_path() == path {
                             (path.clone(), PlannedAction::AlreadyUnified)
                         } else {
@@ -317,6 +482,17 @@ impl Renamer {
                         }
                     }
                 }
+                PlannedAction::Preserved => {
+                    debug!(?source, "Standard camera name preserved");
+                    self.stats.handled.fetch_add(1, Ordering::Relaxed);
+                    self.stats.preserved.fetch_add(1, Ordering::Relaxed);
+                    results.push(RenameResult {
+                        source,
+                        destination: None,
+                        status: RenameStatus::Preserved,
+                        error: None,
+                    });
+                }
                 PlannedAction::AlreadyUnified => {
                     debug!(?source, "Filename already unified");
                     self.stats.handled.fetch_add(1, Ordering::Relaxed);
@@ -394,6 +570,19 @@ mod tests {
         bytes
     }
 
+    /// 构造带 XMP Motion Photo 标记的最小 JPEG（APP1 + XMP + EOI）
+    fn xmp_motion_jpeg() -> Vec<u8> {
+        let xmp_payload =
+            b"http://ns.adobe.com/xap/1.0/\0<rdf><MicroVideoOffset>1234</MicroVideoOffset></rdf>";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        bytes.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        bytes.extend_from_slice(&((xmp_payload.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(xmp_payload);
+        bytes.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        bytes
+    }
+
     fn rename_config(input: &Path) -> Config {
         Config {
             input_dirs: vec![input.to_path_buf()],
@@ -406,34 +595,184 @@ mod tests {
     #[test]
     fn test_build_unified_filename() {
         let dir = Path::new("/photos");
-        let source = dir.join("IMG_20240115_143000.jpg");
-        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"));
-        assert_eq!(target, dir.join("20240115_143000.jpg"));
+        let config = Config::default();
+
+        // 照片 → IMG 前缀
+        let source = dir.join("DSC_0001.jpg");
+        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        assert_eq!(target, dir.join("IMG_20240115_143000.jpg"));
+
+        // 视频 → VID 前缀
+        let source = dir.join("DSC_0001.mp4");
+        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        assert_eq!(target, dir.join("VID_20240115_143000.mp4"));
+
+        // RAW → IMG 前缀
+        let source = dir.join("DSC_0001.arw");
+        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        assert_eq!(target, dir.join("IMG_20240115_143000.arw"));
+
+        // 动态照片文件名（MVIMG_ 开头）→ MVIMG 前缀
+        let source = dir.join("MVIMG_20240115_143000_HDR.jpg");
+        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        assert_eq!(target, dir.join("MVIMG_20240115_143000.jpg"));
 
         // 扩展名大小写保留
         let source = dir.join("IMG_20240115_143000.JPG");
-        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"));
-        assert_eq!(target, dir.join("20240115_143000.JPG"));
+        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        assert_eq!(target, dir.join("IMG_20240115_143000.JPG"));
 
         // 无扩展名
         let source = dir.join("IMG_20240115_143000");
-        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"));
-        assert_eq!(target, dir.join("20240115_143000"));
+        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        assert_eq!(target, dir.join("IMG_20240115_143000"));
     }
 
     #[test]
     fn test_is_already_unified() {
         let dir = Path::new("/photos");
         let timestamp = dt("2024-01-15 14:30:00");
+        let config = Config::default();
 
         assert!(is_already_unified(
-            &dir.join("20240115_143000.jpg"),
-            &timestamp
+            &dir.join("IMG_20240115_143000.jpg"),
+            &timestamp,
+            &config
         ));
         assert!(!is_already_unified(
-            &dir.join("IMG_20240115_143000.jpg"),
-            &timestamp
+            &dir.join("20240115_143000.jpg"),
+            &timestamp,
+            &config
         ));
+    }
+
+    #[test]
+    fn test_standard_name_prefix() {
+        let dir = Path::new("/photos");
+        let config = Config::default();
+
+        assert_eq!(standard_name_prefix(&dir.join("photo.jpg"), &config), "IMG");
+        assert_eq!(standard_name_prefix(&dir.join("photo.arw"), &config), "IMG");
+        assert_eq!(standard_name_prefix(&dir.join("video.mp4"), &config), "VID");
+        // MVIMG_ 文件名 → 动态照片
+        assert_eq!(
+            standard_name_prefix(&dir.join("MVIMG_20240115_143000.jpg"), &config),
+            "MVIMG"
+        );
+    }
+
+    #[test]
+    fn test_is_dynamic_photo_detects_filename_and_xmp_marker() {
+        let dir = tempdir().unwrap();
+
+        // MVIMG_ 文件名
+        let named = dir.path().join("MVIMG_20240115_143000_HDR.jpg");
+        fs::write(&named, b"irrelevant").unwrap();
+        assert!(is_dynamic_photo(&named));
+
+        // XMP MicroVideoOffset 标记（非 MVIMG_ 文件名）
+        let xmp = dir.path().join("PXL_20240115_143000.jpg");
+        fs::write(&xmp, xmp_motion_jpeg()).unwrap();
+        assert!(is_dynamic_photo(&xmp));
+
+        // 普通 JPEG / 无标记文件
+        let plain = dir.path().join("DSC_0001.jpg");
+        fs::write(&plain, b"not a jpeg").unwrap();
+        assert!(!is_dynamic_photo(&plain));
+        assert!(!is_dynamic_photo(&dir.path().join("missing.jpg")));
+    }
+
+    #[test]
+    fn test_is_standard_name() {
+        let dir = Path::new("/photos");
+
+        // 标准开头 + 年月日 + 时分秒
+        assert!(is_standard_name(&dir.join("MVIMG_20240115_143000.jpg")));
+        assert!(is_standard_name(&dir.join("IMG_20240115_143000.jpg")));
+        assert!(is_standard_name(&dir.join("VID_20240115_143000.mp4")));
+
+        // 无论时间部分后面接什么都视为标准名称
+        assert!(is_standard_name(&dir.join("IMG_20240115_143000_HDR.jpg")));
+        assert!(is_standard_name(&dir.join("IMG_20240115_143000_1.jpg")));
+        assert!(is_standard_name(
+            &dir.join("MVIMG_20240115_143000-edit.jpg")
+        ));
+
+        // 不区分大小写
+        assert!(is_standard_name(&dir.join("img_20240115_143000.jpg")));
+
+        // 非标准名称
+        assert!(!is_standard_name(&dir.join("20240115_143000.jpg")));
+        assert!(!is_standard_name(&dir.join("IMG_20240115.jpg")));
+        assert!(!is_standard_name(&dir.join("IMG_2024015_143000.jpg")));
+        assert!(!is_standard_name(&dir.join("IMG_20240115_14300.jpg")));
+        assert!(!is_standard_name(&dir.join("MYIMG_20240115_143000.jpg")));
+        assert!(!is_standard_name(&dir.join("IMGX_20240115_143000.jpg")));
+        assert!(!is_standard_name(&dir.join("VIDEO_20240115_143000.mp4")));
+        assert!(!is_standard_name(&dir.join("photo.jpg")));
+    }
+
+    #[test]
+    fn test_renamer_preserves_standard_names_when_enabled() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        // 标准名称：即使有 EXIF 也保持原名
+        fs::write(
+            input.join("IMG_20240115_143000.jpg"),
+            exif_jpeg("2024:01:15 14:30:00"),
+        )
+        .unwrap();
+        fs::write(
+            input.join("MVIMG_20240115_143000_HDR.jpg"),
+            exif_jpeg("2024:01:15 14:30:00"),
+        )
+        .unwrap();
+        // 非标准名称：仍按元数据重命名
+        fs::write(input.join("DSC_0001.jpg"), exif_jpeg("2024:01:15 15:30:00")).unwrap();
+        // 无元数据：保持原名并进入未修改列表
+        fs::write(input.join("no_meta.jpg"), b"not a jpeg").unwrap();
+
+        let config = Config {
+            preserve_standard_names: true,
+            ..rename_config(&input)
+        };
+        let mut renamer = Renamer::new(config).unwrap();
+        let results = renamer.run().unwrap();
+
+        let statuses: Vec<RenameStatus> = results.iter().map(|r| r.status).collect();
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == RenameStatus::Preserved)
+                .count(),
+            2
+        );
+        assert!(statuses.contains(&RenameStatus::Renamed));
+        assert!(statuses.contains(&RenameStatus::NoMetadata));
+
+        // 标准名称未被修改
+        assert!(input.join("IMG_20240115_143000.jpg").exists());
+        assert!(input.join("MVIMG_20240115_143000_HDR.jpg").exists());
+        // 非标准文件已重命名为标准 IMG 格式
+        assert!(input.join("IMG_20240115_153000.jpg").exists());
+        assert!(!input.join("DSC_0001.jpg").exists());
+
+        let stats = renamer.stats();
+        assert_eq!(stats.handled.load(Ordering::Relaxed), 4);
+        assert_eq!(stats.preserved.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.renamed.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.no_metadata.load(Ordering::Relaxed), 1);
+
+        // 未修改列表只包含无元数据文件，不含被保留的标准名称
+        let list_path = dir.path().join("unmodified_files.txt");
+        let count = write_unmodified_list(&list_path, &results).unwrap();
+        assert_eq!(count, 1);
+        let content = fs::read_to_string(&list_path).unwrap();
+        assert!(content.contains("no_meta.jpg"));
+        assert!(!content.contains("IMG_20240115_143000.jpg"));
+        assert!(!content.contains("MVIMG_20240115_143000_HDR.jpg"));
     }
 
     #[test]
@@ -487,21 +826,13 @@ mod tests {
         let output = dir.path().join("output");
         fs::create_dir_all(&input).unwrap();
 
-        // 有 EXIF：重命名为统一格式
-        fs::write(
-            input.join("IMG_20240115_143000.jpg"),
-            exif_jpeg("2024:01:15 14:30:00"),
-        )
-        .unwrap();
+        // 有 EXIF：重命名为标准 IMG 格式
+        fs::write(input.join("DSC_0001.jpg"), exif_jpeg("2024:01:15 14:30:00")).unwrap();
         // 同一时间戳的第二张：冲突加 _1 后缀
+        fs::write(input.join("DSC_0002.jpg"), exif_jpeg("2024:01:15 14:30:00")).unwrap();
+        // 已经是标准统一格式：不修改
         fs::write(
-            input.join("IMG_20240115_143000_2.jpg"),
-            exif_jpeg("2024:01:15 14:30:00"),
-        )
-        .unwrap();
-        // 已经是统一格式：不修改
-        fs::write(
-            input.join("20240115_153000.jpg"),
+            input.join("IMG_20240115_153000.jpg"),
             exif_jpeg("2024:01:15 15:30:00"),
         )
         .unwrap();
@@ -520,15 +851,15 @@ mod tests {
         assert!(statuses.contains(&RenameStatus::AlreadyUnified));
         assert!(statuses.contains(&RenameStatus::NoMetadata));
 
-        // 已重命名
-        assert!(input.join("20240115_143000.jpg").exists());
-        assert!(input.join("20240115_143000_1.jpg").exists());
-        // 已是统一格式的原名仍在
-        assert!(input.join("20240115_153000.jpg").exists());
+        // 已重命名为标准 IMG 格式
+        assert!(input.join("IMG_20240115_143000.jpg").exists());
+        assert!(input.join("IMG_20240115_143000_1.jpg").exists());
+        // 已是标准统一格式的原名仍在
+        assert!(input.join("IMG_20240115_153000.jpg").exists());
         // 无元数据文件未动
         assert!(input.join("no_meta.jpg").exists());
-        assert!(!input.join("IMG_20240115_143000.jpg").exists());
-        assert!(!input.join("IMG_20240115_143000_2.jpg").exists());
+        assert!(!input.join("DSC_0001.jpg").exists());
+        assert!(!input.join("DSC_0002.jpg").exists());
 
         let stats = renamer.stats();
         assert_eq!(stats.handled.load(Ordering::Relaxed), 4);
@@ -544,11 +875,7 @@ mod tests {
         let input = dir.path().join("input");
         fs::create_dir_all(&input).unwrap();
 
-        fs::write(
-            input.join("IMG_20240115_143000.jpg"),
-            exif_jpeg("2024:01:15 14:30:00"),
-        )
-        .unwrap();
+        fs::write(input.join("DSC_0001.jpg"), exif_jpeg("2024:01:15 14:30:00")).unwrap();
 
         let config = Config {
             dry_run: true,
@@ -559,8 +886,8 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, RenameStatus::DryRun);
-        assert!(input.join("IMG_20240115_143000.jpg").exists());
-        assert!(!input.join("20240115_143000.jpg").exists());
+        assert!(input.join("DSC_0001.jpg").exists());
+        assert!(!input.join("IMG_20240115_143000.jpg").exists());
     }
 
     #[test]

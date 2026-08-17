@@ -1,6 +1,6 @@
 [package]
 name = "gallery-sorter"
-version = "1.5.0"
+version = "1.5.5"
 edition = "2024"
 authors = ["PianCat"]
 description = "A  CLI tool for photo album organization with intelligent time-based classification"
@@ -71,6 +71,7 @@ winapi = { version = "0.3", features = [
     "shellapi",
     "securitybaseapi",
     "handleapi",
+    "fileapi",
 ] }
 
 [target.'cfg(unix)'.dependencies]

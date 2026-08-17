@@ -2,8 +2,7 @@
 //!
 //! 负责渲染调度与处理执行过程。
 
-use crate::process::{FileResult, ProcessingStats, ProcessingStatus};
-use crate::rename::{RenameResult, RenameStatus, Renamer, write_unmodified_list};
+use crate::process::{FileResult, ProcessingStats};
 use crate::tui::event::{EventPoll, TuiEvent};
 use crate::tui::screens;
 use crate::tui::state::{AppState, ProgressState, Screen, SummaryState};
@@ -19,16 +18,12 @@ pub fn run_processing(
     config: crate::config::Config,
     log_path: Option<std::path::PathBuf>,
 ) -> std::io::Result<SummaryState> {
-    if config.unify_filenames {
-        return run_rename_processing(terminal, config, log_path);
-    }
     run_organize_processing(terminal, config, log_path)
 }
 
 /// 后台处理上下文（进度线程共享状态 + 结果通道）
 struct ProcessingBackground {
     stats: Arc<ProcessingStats>,
-    rename_stats: Option<Arc<crate::rename::RenameStats>>,
     cancel: Arc<AtomicBool>,
     total_files: usize,
     rx: std::sync::mpsc::Receiver<Result<(), ()>>,
@@ -66,11 +61,6 @@ fn run_with_background(
 
         if let Ok(Ok(())) = background.rx.recv_timeout(Duration::from_millis(50)) {
             break;
-        }
-
-        // 统一化模式下把 RenameStats 同步到进度统计，保证进度实时更新
-        if let Some(rename_stats) = &background.rename_stats {
-            sync_rename_progress(&background.stats, rename_stats);
         }
 
         frame_index += 1;
@@ -132,129 +122,12 @@ fn run_organize_processing(
         log_path,
         ProcessingBackground {
             stats,
-            rename_stats: None,
             cancel,
             total_files,
             rx,
             handle,
         },
     )
-}
-
-/// 文件名统一化流水线（Renamer）
-fn run_rename_processing(
-    terminal: &mut DefaultTerminal,
-    config: crate::config::Config,
-    log_path: Option<std::path::PathBuf>,
-) -> std::io::Result<SummaryState> {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let mut renamer = match Renamer::new_with_cancel(config.clone(), cancel.clone()) {
-        Ok(r) => r,
-        Err(_) => {
-            let stats = ProcessingStats::new();
-            return Ok(SummaryState::new(
-                stats,
-                Vec::new(),
-                config.dry_run,
-                log_path,
-            ));
-        }
-    };
-
-    let total_files = renamer.total_files_count().unwrap_or(0);
-    let progress_stats = Arc::new(ProcessingStats::new());
-    let rename_stats = renamer.stats_arc();
-    let report_path = config.get_unmodified_list_file();
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), ()>>();
-
-    let handle = std::thread::spawn(move || {
-        let results = renamer.run().unwrap_or_default();
-        if !config.dry_run
-            && let Err(e) = write_unmodified_list(&report_path, &results)
-        {
-            tracing::warn!(error = %e, "Failed to write unmodified files list");
-        }
-        let final_stats = to_processing_stats(renamer.stats());
-
-        let _ = tx.send(Ok(()));
-
-        (final_stats, to_file_results(results))
-    });
-
-    run_with_background(
-        terminal,
-        &config,
-        log_path,
-        ProcessingBackground {
-            stats: progress_stats,
-            rename_stats: Some(rename_stats),
-            cancel,
-            total_files,
-            rx,
-            handle,
-        },
-    )
-}
-
-/// 把 RenameStats 映射为 ProcessingStats（TUI 摘要复用现有统计展示）
-fn to_processing_stats(stats: &crate::rename::RenameStats) -> ProcessingStats {
-    let result = ProcessingStats::new();
-    result
-        .total_files
-        .store(stats.total_files.load(Ordering::Relaxed), Ordering::Relaxed);
-    result
-        .processed
-        .store(stats.renamed.load(Ordering::Relaxed), Ordering::Relaxed);
-    result.skipped.store(
-        stats.already_unified.load(Ordering::Relaxed) + stats.no_metadata.load(Ordering::Relaxed),
-        Ordering::Relaxed,
-    );
-    result
-        .failed
-        .store(stats.failed.load(Ordering::Relaxed), Ordering::Relaxed);
-    result
-}
-
-/// 把 RenameStats 同步到 ProcessingStats 进度统计（进度屏实时显示）
-///
-/// 进度条按“已处理”文件数推进；已统一 / 无元数据 / 失败都算已处理，
-/// 最终摘要由 [`to_processing_stats`] 重新映射。
-fn sync_rename_progress(progress: &ProcessingStats, rename_stats: &crate::rename::RenameStats) {
-    progress.total_files.store(
-        rename_stats.total_files.load(Ordering::Relaxed),
-        Ordering::Relaxed,
-    );
-    progress.processed.store(
-        rename_stats.handled.load(Ordering::Relaxed),
-        Ordering::Relaxed,
-    );
-    progress.skipped.store(0, Ordering::Relaxed);
-    progress.failed.store(
-        rename_stats.failed.load(Ordering::Relaxed),
-        Ordering::Relaxed,
-    );
-}
-
-/// 把 RenameResult 映射为 FileResult（TUI 摘要复用现有结果展示）
-fn to_file_results(results: Vec<RenameResult>) -> Vec<FileResult> {
-    results
-        .into_iter()
-        .map(|r| FileResult {
-            source: r.source,
-            destination: r.destination,
-            time_info: None,
-            status: match r.status {
-                RenameStatus::Renamed => ProcessingStatus::Success,
-                RenameStatus::DryRun => ProcessingStatus::DryRun,
-                RenameStatus::AlreadyUnified | RenameStatus::NoMetadata => {
-                    ProcessingStatus::Skipped
-                }
-                RenameStatus::Failed => ProcessingStatus::Failed,
-                RenameStatus::Cancelled => ProcessingStatus::Cancelled,
-            },
-            error: r.error,
-        })
-        .collect()
 }
 
 /// 进度屏取消事件判定（Esc / q / Q）
@@ -300,7 +173,6 @@ fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn test_is_cancel_event() {
@@ -324,64 +196,5 @@ mod tests {
         assert!(!should_skip_render(10, 0));
         // 第一帧不跳过
         assert!(!should_skip_render(0, 2));
-    }
-
-    #[test]
-    fn test_sync_rename_progress_maps_rename_stats() {
-        let rename_stats = crate::rename::RenameStats {
-            total_files: AtomicUsize::new(4),
-            handled: AtomicUsize::new(4),
-            renamed: AtomicUsize::new(2),
-            already_unified: AtomicUsize::new(1),
-            no_metadata: AtomicUsize::new(1),
-            failed: AtomicUsize::new(0),
-        };
-
-        // 最终摘要：processed = 实际重命名数，skipped = 已统一 + 无元数据
-        let final_stats = to_processing_stats(&rename_stats);
-        assert_eq!(final_stats.processed.load(Ordering::Relaxed), 2);
-        assert_eq!(final_stats.skipped.load(Ordering::Relaxed), 2);
-
-        // 实时进度：processed = 已处理数（保证进度条走满）
-        let live = ProcessingStats::new();
-        sync_rename_progress(&live, &rename_stats);
-        assert_eq!(live.processed.load(Ordering::Relaxed), 4);
-        assert_eq!(live.skipped.load(Ordering::Relaxed), 0);
-        assert_eq!(live.total_files.load(Ordering::Relaxed), 4);
-    }
-
-    #[test]
-    fn test_to_file_results_maps_rename_statuses() {
-        let results = vec![
-            RenameResult {
-                source: std::path::PathBuf::from("a.jpg"),
-                destination: Some(std::path::PathBuf::from("20240115_143000.jpg")),
-                status: RenameStatus::Renamed,
-                error: None,
-            },
-            RenameResult {
-                source: std::path::PathBuf::from("b.jpg"),
-                destination: None,
-                status: RenameStatus::NoMetadata,
-                error: None,
-            },
-            RenameResult {
-                source: std::path::PathBuf::from("c.jpg"),
-                destination: None,
-                status: RenameStatus::Failed,
-                error: Some("boom".into()),
-            },
-        ];
-
-        let mapped = to_file_results(results);
-
-        assert_eq!(mapped[0].status, ProcessingStatus::Success);
-        assert_eq!(
-            mapped[0].destination,
-            Some(std::path::PathBuf::from("20240115_143000.jpg"))
-        );
-        assert_eq!(mapped[1].status, ProcessingStatus::Skipped);
-        assert_eq!(mapped[2].status, ProcessingStatus::Failed);
-        assert_eq!(mapped[2].error.as_deref(), Some("boom"));
     }
 }

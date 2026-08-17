@@ -10,7 +10,6 @@ pub mod args;
 pub mod config;
 pub mod logging;
 pub mod output;
-pub mod rename;
 pub mod run;
 
 pub use args::{Cli, should_run_interactive};
@@ -20,7 +19,6 @@ pub use output::{
     CliTheme, print_blank, print_error, print_hint, print_key_value, print_log_path, print_result,
     print_separator, print_stat, print_title, print_warning,
 };
-pub use rename::run_unify_cli;
 pub use run::{run_cli_mode, run_interactive_mode};
 
 /// 获取可执行文件所在目录

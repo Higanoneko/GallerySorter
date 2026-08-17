@@ -11,9 +11,10 @@ Gallery Sorter is a CLI + TUI tool for organizing photos and videos by creation 
 - Flexible classification: none/year/year-month, nested or combined month format
 - Processing modes: incremental (default), supplement, full
 - Parallel processing with configurable threads and dry-run support
-- Filename unification: rename files in place to `YYYYMMDD_HHMMSS.ext` from
-  EXIF / FFprobe metadata; files without metadata stay unchanged and are
-  written to an unmodified-files list
+- Filename unification: rename files to standard camera names
+  (`MVIMG_`/`IMG_`/`VID_` + `YYYYMMDD_HHMMSS`) from EXIF / FFprobe metadata
+  while organizing; files without metadata keep their names and are written
+  to an unmodified-files list
 - Interactive Ratatui wizard and full CLI automation
 - Bilingual UI (English and Simplified Chinese)
 
@@ -74,8 +75,11 @@ gallery-sorter \
   --deduplicate \
   --dry-run
 
-# Filename unification (in-place rename, EXIF / FFprobe metadata only)
-gallery-sorter --unify-filenames -i /path/to/photos
+# Filename unification while organizing (rename + copy/move to output)
+gallery-sorter --unify-filenames --operation move -i /path/to/photos -o /path/to/sorted
+
+# Same, but keep standard camera names (MVIMG_/IMG_/VID_ + timestamp pattern)
+gallery-sorter --unify-filenames --preserve-standard-names -i /path/to/photos
 ```
 
 ### Options
@@ -95,7 +99,8 @@ gallery-sorter --unify-filenames -i /path/to/photos
 | `--threads` | `-t` | Thread count (0 = auto) |
 | `--large-file-mb` |  | Large-file threshold in MB |
 | `--dry-run` | `-n` | Preview without writing |
-| `--unify-filenames` |  | Unify filenames from EXIF / FFprobe metadata (in-place rename) |
+| `--unify-filenames` |  | Rename files to standard camera names from EXIF / FFprobe metadata while organizing |
+| `--preserve-standard-names` |  | Keep standard camera names (`MVIMG_`/`IMG_`/`VID_` + `_YYYYMMDD_HHMMSS` pattern) unchanged |
 | `--unmodified-list` |  | Path for the unmodified files list (default `<output_dir>/unmodified_files.txt`) |
 | `--verbose` | `-v` | Verbose output |
 | `--json-log` |  | JSON formatted logs |
@@ -103,15 +108,25 @@ gallery-sorter --unify-filenames -i /path/to/photos
 ### Filename Unification
 
 `--unify-filenames` scans the input directories and parses the creation time
-from EXIF (images) or FFprobe (videos) only, then renames each file in place to
-`YYYYMMDD_HHMMSS.ext` (e.g. `IMG_20240115_143022.jpg` →
-`20240115_143022.jpg`). Collisions in the same directory get `_1`, `_2`, ...
-suffixes automatically.
+from EXIF (images) or FFprobe (videos) only, then names the files in the
+output directory with standard camera names: `IMG_YYYYMMDD_HHMMSS.ext` for
+photos and RAW files, `MVIMG_YYYYMMDD_HHMMSS.ext` for dynamic (Motion Photo)
+files, and `VID_YYYYMMDD_HHMMSS.ext` for videos. The configured operation
+(copy/move/hardlink/symlink) still applies, so files are both renamed and
+placed into the output directory. Collisions get `_1`, `_2`, ... suffixes
+automatically.
 
-Files whose creation time cannot be parsed from metadata are left unchanged;
-their paths are written to the unmodified files list (default
+With `--preserve-standard-names`, files whose names already follow the standard
+camera pattern — `MVIMG_`, `IMG_` or `VID_` followed by `_YYYYMMDD_HHMMSS`,
+with anything after the timestamp allowed — are not renamed (but are still
+moved/copied to the output directory) and are excluded from the unmodified
+files list.
+
+Files whose creation time cannot be parsed from metadata keep their filenames
+(they are still moved/copied per the configured operation); their source paths
+are written to the unmodified files list (default
 `<output_dir>/unmodified_files.txt`, overridable with `--unmodified-list`).
-Dry-run mode (`--dry-run`) writes neither the list nor any filename change.
+Dry-run mode (`--dry-run`) writes neither the list nor performs any operation.
 
 ## Configuration
 
@@ -132,6 +147,7 @@ operation = "copy"
 deduplicate = true
 dry_run = false
 unify_filenames = false
+preserve_standard_names = false
 verbose = false
 ```
 

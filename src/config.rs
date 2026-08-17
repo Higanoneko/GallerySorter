@@ -290,9 +290,13 @@ pub struct Config {
     /// Dry run mode - don't actually move/copy files
     pub dry_run: bool,
 
-    /// Unify filenames based on EXIF / FFprobe metadata (rename in place)
+    /// Unify filenames to standard camera names while organizing
     #[serde(default)]
     pub unify_filenames: bool,
+
+    /// Preserve standard camera names (MVIMG_/IMG_/VID_ + timestamp pattern)
+    #[serde(default)]
+    pub preserve_standard_names: bool,
 
     /// Output file for the list of files left unmodified (rename mode)
     #[serde(default)]
@@ -328,6 +332,7 @@ impl Default for Config {
             large_file_threshold: 100 * 1024 * 1024, // 100MB
             dry_run: false,
             unify_filenames: false,
+            preserve_standard_names: false,
             unmodified_list_file: None,
             verbose: false,
             image_extensions: vec![
@@ -544,10 +549,17 @@ large_file_threshold = 104857600
 # Dry run mode - show what would be done without actually doing it
 dry_run = false
 
-# Unify filenames based on EXIF / FFprobe metadata (rename files in place)
-# Files without EXIF/FFprobe metadata are left unchanged and listed in
+# Unify filenames based on EXIF / FFprobe metadata while organizing.
+# Photos/RAW become IMG_YYYYMMDD_HHMMSS, dynamic photos MVIMG_YYYYMMDD_HHMMSS,
+# videos VID_YYYYMMDD_HHMMSS; the configured operation (copy/move/...) still applies.
+# Files without EXIF/FFprobe metadata keep their names and are listed in
 # unmodified_files.txt under the output directory.
 unify_filenames = false
+
+# Preserve standard camera names in rename mode.
+# Files starting with MVIMG_/IMG_/VID_ followed by _YYYYMMDD_HHMMSS
+# (anything after the timestamp is allowed) are left unchanged.
+preserve_standard_names = false
 
 # Custom path for the unmodified files list (rename mode)
 # Default: <output_dir>/unmodified_files.txt

@@ -140,12 +140,17 @@ dry_run = false
 # FILENAME UNIFICATION (RENAME)
 # ============================================================
 
-# Unify filenames based on EXIF / FFprobe metadata.
-# When enabled, files are renamed in place to YYYYMMDD_HHMMSS.ext using the
-# creation time parsed from EXIF (images) or FFprobe (videos).
-# Files without parseable metadata are left unchanged and listed in the
+# Unify filenames based on EXIF / FFprobe metadata while organizing.
+# Photos/RAW become IMG_YYYYMMDD_HHMMSS, dynamic photos MVIMG_YYYYMMDD_HHMMSS,
+# videos VID_YYYYMMDD_HHMMSS; the configured operation (copy/move/...) still applies.
+# Files without parseable metadata keep their names and are listed in the
 # unmodified files list.
 unify_filenames = false
+
+# Preserve standard camera names in rename mode.
+# Files starting with MVIMG_ / IMG_ / VID_ followed by _YYYYMMDD_HHMMSS
+# (anything after the timestamp is allowed) are left unchanged.
+preserve_standard_names = false
 
 # Custom path for the unmodified files list (rename mode only).
 # Leave commented to use default: <output_dir>/unmodified_files.txt

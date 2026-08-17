@@ -6,14 +6,17 @@
 //! - Computing hashes for deduplication
 //! - Organizing files to output directory
 
-use crate::config::{
-    ClassificationRule, Config, FileOperation, FileType, MonthFormat, ProcessingMode,
-};
+use crate::config::{Config, FileOperation, ProcessingMode};
 use crate::error::{Error, Result};
 use crate::hash::{compute_file_hash, compute_metadata_hash};
+use crate::rename::write_unmodified_paths;
 use crate::state::{IncrementalWatermark, ProcessingState};
 use crate::time::{ExtractedTime, extract_time};
-use chrono::{Datelike, NaiveDateTime};
+use chrono::NaiveDateTime;
+
+mod destination;
+
+use destination::{build_base_destination_path, should_list_as_unmodified};
 
 use rayon::prelude::*;
 use regex::Regex;
@@ -490,7 +493,7 @@ impl Processor {
                         }
                         .or_else(|| hash_to_best_file.get(hash).cloned());
 
-                        debug!(
+                        info!(
                             ?file_path,
                             ?dest,
                             "Skipping duplicate file (inferior filename)"
@@ -538,6 +541,34 @@ impl Processor {
 
             // Update watermark with newest processed file
             self.update_watermark(&results)?;
+        }
+
+        // 统一文件名模式：把“无元数据未改名 / 处理失败”的源文件写入未修改列表
+        if self.config.unify_filenames && !self.config.dry_run {
+            let unmodified: Vec<PathBuf> = results
+                .iter()
+                .filter(|r| should_list_as_unmodified(r, &self.config))
+                .map(|r| r.source.clone())
+                .collect();
+            if !unmodified.is_empty() {
+                let list_path = self.config.get_unmodified_list_file();
+                match write_unmodified_paths(&list_path, &unmodified) {
+                    Ok(count) => {
+                        info!(
+                            path = %list_path.display(),
+                            count,
+                            "Wrote unmodified files list"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %list_path.display(),
+                            error = %e,
+                            "Failed to write unmodified files list"
+                        );
+                    }
+                }
+            }
         }
 
         // Log summary
@@ -682,7 +713,7 @@ fn process_single_file(
         && let Some(hash) = content_hash
         && existing_hashes.contains(&hash)
     {
-        debug!(
+        info!(
             ?path,
             "File already exists in target (Supplement mode), skipping"
         );
@@ -741,7 +772,7 @@ fn process_single_file(
     {
         let state_guard = state.lock().unwrap();
         if let Some(existing) = state_guard.has_content_hash(hash) {
-            debug!(?path, ?existing, "Duplicate file detected (from state)");
+            info!(?path, ?existing, "Duplicate file detected (from state)");
             stats.duplicates.fetch_add(1, Ordering::Relaxed);
             return FileResult {
                 source: path.to_path_buf(),
@@ -754,7 +785,7 @@ fn process_single_file(
     }
 
     // Build base destination path (without conflict resolution)
-    let base_dest_path = match build_base_destination_path(path, &time_info.timestamp, config) {
+    let base_dest_path = match build_base_destination_path(path, &time_info, config) {
         Ok(p) => p,
         Err(e) => {
             error!(?path, error = %e, "Failed to build destination path");
@@ -797,7 +828,7 @@ fn process_single_file(
                         }
                         ProcessingMode::Supplement | ProcessingMode::Incremental => {
                             // Supplement/Incremental: skip file with same content
-                            debug!(
+                            info!(
                                 ?path,
                                 ?base_dest_path,
                                 "Skipping file - destination already exists with identical content"
@@ -963,61 +994,6 @@ fn process_single_file(
     }
 }
 
-/// Build the base destination path based on classification rules (without conflict resolution)
-fn build_base_destination_path(
-    source: &Path,
-    timestamp: &NaiveDateTime,
-    config: &Config,
-) -> Result<PathBuf> {
-    let filename = source
-        .file_name()
-        .ok_or_else(|| Error::Config("Invalid source filename".into()))?;
-
-    let mut dest = config.output_dir.clone();
-
-    // Time-based classification
-    match config.classification {
-        ClassificationRule::None => {
-            // Files go directly to output directory
-        }
-        ClassificationRule::Year => {
-            dest.push(format!("{}", timestamp.year()));
-        }
-        ClassificationRule::YearMonth => match config.month_format {
-            MonthFormat::Nested => {
-                dest.push(format!("{}", timestamp.year()));
-                dest.push(format!("{:02}", timestamp.month()));
-            }
-            MonthFormat::Combined => {
-                dest.push(format!("{}-{:02}", timestamp.year(), timestamp.month()));
-            }
-        },
-    }
-
-    // File type classification (after time classification)
-    if config.classify_by_type
-        && let Some(ext) = source.extension().and_then(|e| e.to_str())
-        && let Some(file_type) = config.get_file_type(ext)
-    {
-        match file_type {
-            FileType::Photos => {
-                dest.push(file_type.folder_name());
-            }
-            FileType::Raw => {
-                // RAW files are nested under Photos/Raw
-                dest.push(FileType::Photos.folder_name());
-                dest.push(file_type.folder_name());
-            }
-            FileType::Videos => {
-                dest.push(file_type.folder_name());
-            }
-        }
-    }
-
-    dest.push(filename);
-    Ok(dest)
-}
-
 /// Resolve filename conflicts by adding a numeric suffix
 fn resolve_filename_conflict(path: PathBuf) -> Result<PathBuf> {
     resolve_filename_conflict_with(path, &HashSet::new())
@@ -1139,16 +1115,12 @@ fn perform_file_operation(source: &Path, dest: &Path, config: &Config) -> Result
 
     match config.operation {
         FileOperation::Copy => {
+            // 复制会新建目标文件：操作前读取源时间，完成后还原创建时间与修改时间
+            let times = crate::os::read_file_times(source)?;
             copy_file(source, dest)?;
+            crate::os::restore_file_times(dest, &times)?;
         }
-        FileOperation::Move => {
-            // Try rename first (faster for same filesystem)
-            if fs::rename(source, dest).is_err() {
-                // Fall back to copy + delete for cross-filesystem moves
-                copy_file(source, dest)?;
-                fs::remove_file(source)?;
-            }
-        }
+        FileOperation::Move => move_file_preserving_times(source, dest)?,
         FileOperation::Symlink => {
             #[cfg(unix)]
             {
@@ -1165,13 +1137,36 @@ fn perform_file_operation(source: &Path, dest: &Path, config: &Config) -> Result
         }
     }
 
-    // Preserve modification time
-    if let Ok(metadata) = fs::metadata(source)
+    // Symlink/Hardlink 与源文件共享同一目标，时间戳天然一致；
+    // 保留原有的修改时间兜底逻辑
+    if matches!(
+        config.operation,
+        FileOperation::Symlink | FileOperation::Hardlink
+    ) && let Ok(metadata) = fs::metadata(source)
         && let Ok(mtime) = metadata.modified()
     {
         let _ = filetime::set_file_mtime(dest, filetime::FileTime::from_system_time(mtime));
     }
 
+    Ok(())
+}
+
+/// 移动文件并保留时间戳：同卷 `rename` 由文件系统天然保留；失败时回退为复制 + 删除。
+fn move_file_preserving_times(source: &Path, dest: &Path) -> Result<()> {
+    if fs::rename(source, dest).is_ok() {
+        return Ok(());
+    }
+    move_file_fallback(source, dest)
+}
+
+/// `rename` 失败（跨卷移动等）时的回退：复制 → 还原时间戳 → 删除源文件。
+///
+/// 时间戳在删除源文件前读取并写回，避免源文件删除后无法读取元数据。
+fn move_file_fallback(source: &Path, dest: &Path) -> Result<()> {
+    let times = crate::os::read_file_times(source)?;
+    copy_file(source, dest)?;
+    crate::os::restore_file_times(dest, &times)?;
+    fs::remove_file(source)?;
     Ok(())
 }
 
@@ -1207,6 +1202,48 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, format!("content-{}", name)).unwrap();
         path
+    }
+
+    /// 构造带 DateTimeOriginal 的最小 JPEG（APP1 + EXIF TIFF + EOI）
+    fn exif_jpeg(datetime: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"Exif\0\0");
+        payload.extend_from_slice(b"II\x2A\x00\x08\x00\x00\x00");
+        // IFD0（offset 8）：1 个 ExifIFDPointer 条目 → Exif 子 IFD 位于 0x1A
+        payload.extend_from_slice(&[0x01, 0x00]);
+        payload.extend_from_slice(&[
+            0x69, 0x87, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x1A, 0x00, 0x00, 0x00,
+        ]);
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
+        // Exif 子 IFD（offset 0x1A）：1 个 DateTimeOriginal 条目
+        payload.extend_from_slice(&[0x01, 0x00]);
+        payload.extend_from_slice(&[
+            0x03, 0x90, 0x02, 0x00, 0x14, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00,
+        ]);
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
+        payload.extend_from_slice(datetime.as_bytes());
+        payload.push(0);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        bytes.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        bytes.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        bytes
+    }
+
+    /// 在 EXIF JPEG 前追加 XMP Motion Photo 标记段（用于动态照片识别）
+    fn exif_motion_jpeg(datetime: &str) -> Vec<u8> {
+        let xmp_payload =
+            b"http://ns.adobe.com/xap/1.0/\0<rdf><MicroVideoOffset>1234</MicroVideoOffset></rdf>";
+        let mut bytes = exif_jpeg(datetime);
+        bytes.truncate(bytes.len() - 2); // 去掉 EOI
+        bytes.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        bytes.extend_from_slice(&((xmp_payload.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(xmp_payload);
+        bytes.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        bytes
     }
 
     fn incremental_config(input: &Path, output: &Path) -> Config {
@@ -1256,6 +1293,121 @@ mod tests {
         assert!(summary.contains("Skipped: 2"));
         assert!(summary.contains("Duplicates: 1"));
         assert!(summary.contains("Failed: 1"));
+    }
+
+    fn unify_move_config(input: &Path, output: &Path) -> Config {
+        Config {
+            input_dirs: vec![input.to_path_buf()],
+            output_dir: output.to_path_buf(),
+            processing_mode: ProcessingMode::Full,
+            operation: FileOperation::Move,
+            deduplicate: false,
+            unify_filenames: true,
+            threads: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_unify_filenames_moves_and_renames_to_output() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+
+        // 有 EXIF：移动到输出目录并重命名为标准 IMG 格式
+        fs::write(input.join("DSC_0001.jpg"), exif_jpeg("2024:01:15 14:30:00")).unwrap();
+        // 无元数据：移动到输出目录但保持原名，并写入未修改列表
+        fs::write(input.join("no_meta.jpg"), b"not a jpeg").unwrap();
+
+        let config = unify_move_config(&input, &output);
+        let mut processor = Processor::new(config).unwrap();
+        let results = processor.run().unwrap();
+
+        assert_eq!(results.len(), 2);
+        // 源文件都被移走
+        assert!(!input.join("DSC_0001.jpg").exists());
+        assert!(!input.join("no_meta.jpg").exists());
+        // 输出目录：重命名文件 + 保持原名的文件
+        assert!(output.join("IMG_20240115_143000.jpg").exists());
+        assert!(output.join("no_meta.jpg").exists());
+
+        // 未修改列表只包含无元数据文件
+        let list = fs::read_to_string(output.join("unmodified_files.txt")).unwrap();
+        assert!(list.contains("no_meta.jpg"));
+        assert!(!list.contains("DSC_0001.jpg"));
+    }
+
+    #[test]
+    fn test_unify_filenames_dynamic_photo_uses_mvimg_prefix() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+
+        // 非 MVIMG_ 文件名但带 XMP Motion Photo 标记 → MVIMG 前缀
+        fs::write(
+            input.join("PXL_20240115_143000.jpg"),
+            exif_motion_jpeg("2024:01:15 14:30:00"),
+        )
+        .unwrap();
+
+        let config = unify_move_config(&input, &output);
+        let mut processor = Processor::new(config).unwrap();
+        processor.run().unwrap();
+
+        assert!(output.join("MVIMG_20240115_143000.jpg").exists());
+        assert!(!input.join("PXL_20240115_143000.jpg").exists());
+    }
+
+    #[test]
+    fn test_unify_filenames_preserves_standard_name_but_still_moves() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+
+        fs::write(
+            input.join("IMG_20240115_143000.jpg"),
+            exif_jpeg("2024:01:15 14:30:00"),
+        )
+        .unwrap();
+
+        let config = Config {
+            preserve_standard_names: true,
+            ..unify_move_config(&input, &output)
+        };
+        let mut processor = Processor::new(config).unwrap();
+        processor.run().unwrap();
+
+        // 名称保留，但仍移动到输出目录
+        assert!(!input.join("IMG_20240115_143000.jpg").exists());
+        assert!(output.join("IMG_20240115_143000.jpg").exists());
+        // 没有未修改文件 → 不创建列表文件
+        assert!(!output.join("unmodified_files.txt").exists());
+    }
+
+    #[test]
+    fn test_unify_filenames_dry_run_does_not_move_or_write_list() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+
+        fs::write(input.join("DSC_0001.jpg"), exif_jpeg("2024:01:15 14:30:00")).unwrap();
+
+        let config = Config {
+            dry_run: true,
+            ..unify_move_config(&input, &output)
+        };
+        let mut processor = Processor::new(config).unwrap();
+        let results = processor.run().unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ProcessingStatus::DryRun);
+        assert!(input.join("DSC_0001.jpg").exists());
+        assert!(!output.join("IMG_20240115_143000.jpg").exists());
+        assert!(!output.join("unmodified_files.txt").exists());
     }
 
     #[test]
@@ -1506,5 +1658,85 @@ mod tests {
         fs::write(&target, "occupied on disk").unwrap();
         let resolved = resolve_filename_conflict_with(target.clone(), &occupied).unwrap();
         assert_eq!(resolved.file_name().unwrap(), "20240115_143000_1.jpg");
+    }
+
+    /// 固定创建时间（2020-01-01 00:00:00 UTC，整秒避免文件系统精度问题）
+    fn fixed_created_time() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800)
+    }
+
+    /// 固定修改时间（2020-09-13 12:26:40 UTC，整秒）
+    fn fixed_modified_time() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)
+    }
+
+    /// 用已知时间戳覆盖源文件，供时间戳还原测试使用
+    fn set_known_times(path: &Path) {
+        crate::os::restore_file_times(
+            path,
+            &crate::os::FileTimes {
+                created: Some(fixed_created_time()),
+                modified: fixed_modified_time(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_copy_preserves_creation_and_modification_times() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        let dest = dir.path().join("dest.jpg");
+        fs::write(&source, b"photo").unwrap();
+        set_known_times(&source);
+
+        let config = Config {
+            operation: FileOperation::Copy,
+            ..Default::default()
+        };
+        perform_file_operation(&source, &dest, &config).unwrap();
+
+        let meta = fs::metadata(&dest).unwrap();
+        assert_eq!(meta.modified().unwrap(), fixed_modified_time());
+        #[cfg(windows)]
+        assert_eq!(meta.created().unwrap(), fixed_created_time());
+    }
+
+    #[test]
+    fn test_move_preserves_creation_and_modification_times() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        let dest = dir.path().join("dest.jpg");
+        fs::write(&source, b"photo").unwrap();
+        set_known_times(&source);
+
+        let config = Config {
+            operation: FileOperation::Move,
+            ..Default::default()
+        };
+        perform_file_operation(&source, &dest, &config).unwrap();
+
+        assert!(!source.exists());
+        let meta = fs::metadata(&dest).unwrap();
+        assert_eq!(meta.modified().unwrap(), fixed_modified_time());
+        #[cfg(windows)]
+        assert_eq!(meta.created().unwrap(), fixed_created_time());
+    }
+
+    #[test]
+    fn test_move_fallback_preserves_times_and_deletes_source() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        let dest = dir.path().join("dest.jpg");
+        fs::write(&source, b"photo").unwrap();
+        set_known_times(&source);
+
+        move_file_fallback(&source, &dest).unwrap();
+
+        assert!(!source.exists());
+        let meta = fs::metadata(&dest).unwrap();
+        assert_eq!(meta.modified().unwrap(), fixed_modified_time());
+        #[cfg(windows)]
+        assert_eq!(meta.created().unwrap(), fixed_created_time());
     }
 }

@@ -149,18 +149,11 @@ field_file_operation = "文件操作"
 field_deduplication = "文件去重"
 field_dry_run = "试运行"
 field_unify_filenames = "统一文件名"
+field_preserve_standard_names = "保留标准名称"
 
 # Navigation
 go_to_summary = "下一步：查看配置摘要"
 
 # Filename Unification (Rename)
 summary_unify_filenames = "统一文件名："
-unify_complete = "文件名统一完成！"
-unify_cancelled = "文件名统一已取消 - 已完成的修改会保留"
-unify_renamed = "已重命名"
-unify_already_unified = "已统一"
-unify_no_metadata = "无元数据（保持原名）"
-unify_failed = "失败"
-unify_unmodified_list_written = "未修改文件列表："
-unify_no_unmodified = "没有未修改的文件。"
-unify_dry_run_notice = "[试运行] 未实际修改任何文件名。"
+summary_preserve_standard_names = "保留标准名称："

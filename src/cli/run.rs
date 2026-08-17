@@ -1,7 +1,6 @@
 //! CLI 运行编排与结果打印
 
 use crate::cli::output;
-use crate::cli::rename::run_unify_cli;
 use crate::cli::{
     get_executable_dir, get_log_path, load_config, setup_file_only_logging, setup_logging,
     validate_config,
@@ -98,11 +97,6 @@ pub fn run_cli_mode() -> Result<()> {
 
     // Log to file location
     info!(log_file = %log_path.display(), "Log file location");
-
-    // 文件名统一化模式：跳过归档流水线的校验（output 仅用于未修改列表）
-    if config.unify_filenames {
-        return run_unify_cli(config, &log_path);
-    }
 
     // Validate configuration
     validate_config(&config)?;

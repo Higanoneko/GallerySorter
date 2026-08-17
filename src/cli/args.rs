@@ -72,9 +72,13 @@ pub struct Cli {
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
-    /// Unify filenames based on EXIF / FFprobe metadata (rename files in place)
+    /// Unify filenames to standard camera names from EXIF / FFprobe metadata while organizing
     #[arg(long)]
     pub unify_filenames: bool,
+
+    /// Preserve standard camera names (MVIMG_/IMG_/VID_ + timestamp pattern)
+    #[arg(long)]
+    pub preserve_standard_names: bool,
 
     /// Path to the unmodified files list file (rename mode)
     #[arg(long)]
@@ -148,6 +152,9 @@ impl Cli {
         }
         if self.unify_filenames {
             config.unify_filenames = true;
+        }
+        if self.preserve_standard_names {
+            config.preserve_standard_names = true;
         }
         if let Some(ref path) = self.unmodified_list {
             config.unmodified_list_file = Some(path.clone());
@@ -223,6 +230,7 @@ mod tests {
             large_file_mb: None,
             dry_run: false,
             unify_filenames: false,
+            preserve_standard_names: false,
             unmodified_list: None,
             verbose: false,
             json_log: false,
@@ -415,6 +423,23 @@ mod tests {
             cli.unmodified_list,
             Some(PathBuf::from("D:/reports/unmodified.txt"))
         );
+    }
+
+    #[test]
+    fn test_preserve_standard_names_flag_maps_to_config() {
+        let mut cli = base_cli();
+        cli.preserve_standard_names = true;
+
+        let config = cli.to_config();
+
+        assert!(config.preserve_standard_names);
+    }
+
+    #[test]
+    fn test_clap_parses_preserve_standard_names_flag() {
+        let cli = Cli::try_parse_from(["gallery-sorter", "--preserve-standard-names"]).unwrap();
+
+        assert!(cli.preserve_standard_names);
     }
 
     #[test]

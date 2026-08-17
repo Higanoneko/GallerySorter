@@ -309,6 +309,13 @@ fn draw_summary_step(frame: &mut Frame, area: Rect, wizard: &ConfigWizardState) 
             value_width,
         )),
     ]));
+    rows.push(Row::new(vec![
+        Cell::from(t!("summary_preserve_standard_names")),
+        Cell::from(wrap_lines(
+            bool_label(config.preserve_standard_names).as_ref(),
+            value_width,
+        )),
+    ]));
 
     let table = Table::new(rows, [Constraint::Length(15), Constraint::Fill(1)])
         .block(

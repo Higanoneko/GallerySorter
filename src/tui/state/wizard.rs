@@ -473,12 +473,14 @@ pub enum FormField {
     DryRun,
     /// 统一文件名
     UnifyFilenames,
+    /// 保留标准相机名称
+    PreserveStandardNames,
 }
 
 impl FormField {
     /// 字段数量
     pub fn count() -> usize {
-        12
+        13
     }
 
     /// 获取全部字段
@@ -496,6 +498,7 @@ impl FormField {
             FormField::Deduplication,
             FormField::DryRun,
             FormField::UnifyFilenames,
+            FormField::PreserveStandardNames,
         ]
     }
 
@@ -530,6 +533,9 @@ impl FormField {
             FormField::Deduplication => rust_i18n::t!("field_deduplication").to_string(),
             FormField::DryRun => rust_i18n::t!("field_dry_run").to_string(),
             FormField::UnifyFilenames => rust_i18n::t!("field_unify_filenames").to_string(),
+            FormField::PreserveStandardNames => {
+                rust_i18n::t!("field_preserve_standard_names").to_string()
+            }
         }
     }
 
@@ -554,6 +560,9 @@ impl FormField {
             FormField::Deduplication => bool_label(state.deduplicate.value()).to_string(),
             FormField::DryRun => bool_label(state.dry_run.value()).to_string(),
             FormField::UnifyFilenames => bool_label(state.unify_filenames.value()).to_string(),
+            FormField::PreserveStandardNames => {
+                bool_label(state.preserve_standard_names.value()).to_string()
+            }
         }
     }
 
@@ -564,6 +573,8 @@ impl FormField {
             FormField::MonthFormat => {
                 state.classification.selected() == ClassificationRule::YearMonth
             }
+            // 仅在启用“统一文件名”时展示，避免非 rename 流程出现无效选项
+            FormField::PreserveStandardNames => state.unify_filenames.value(),
             _ => true,
         }
     }
@@ -686,6 +697,8 @@ pub struct ConfigWizardState {
     pub classify_by_type: BoolSelection,
     /// 统一文件名
     pub unify_filenames: BoolSelection,
+    /// 保留标准相机名称
+    pub preserve_standard_names: BoolSelection,
     /// 配置名称
     pub config_name: String,
     /// 可用配置列表
@@ -767,6 +780,8 @@ impl ConfigWizardState {
             .select_by_index(if config.classify_by_type { 1 } else { 0 });
         self.unify_filenames
             .select_by_index(if config.unify_filenames { 1 } else { 0 });
+        self.preserve_standard_names
+            .select_by_index(if config.preserve_standard_names { 1 } else { 0 });
         self.config_name = config_path
             .file_stem()
             .map(|os| os.to_string_lossy().to_string())
@@ -801,6 +816,7 @@ impl ConfigWizardState {
             deduplicate: self.deduplicate.value(),
             dry_run: self.dry_run.value(),
             unify_filenames: self.unify_filenames.value(),
+            preserve_standard_names: self.preserve_standard_names.value(),
             verbose: false,
             ..Default::default()
         }
@@ -963,6 +979,7 @@ impl ConfigWizardState {
             Some(FormField::DryRun) => self.dry_run.next(),
             Some(FormField::ClassifyByType) => self.classify_by_type.next(),
             Some(FormField::UnifyFilenames) => self.unify_filenames.next(),
+            Some(FormField::PreserveStandardNames) => self.preserve_standard_names.next(),
             _ => {}
         }
     }
@@ -981,6 +998,7 @@ impl ConfigWizardState {
             Some(FormField::DryRun) => self.dry_run.prev(),
             Some(FormField::ClassifyByType) => self.classify_by_type.prev(),
             Some(FormField::UnifyFilenames) => self.unify_filenames.prev(),
+            Some(FormField::PreserveStandardNames) => self.preserve_standard_names.prev(),
             _ => {}
         }
     }
@@ -1359,7 +1377,7 @@ mod tests {
         state.config_wizard.config_name = "album".to_string();
         state.config_wizard.input_dirs = "D:/photos".to_string();
         state.config_wizard.output_dir = "D:/sorted".to_string();
-        // 将选中索引移到“下一步”伪字段（可见字段 11 个 → 索引 11）
+        // 将选中索引移到“下一步”伪字段（unify 关闭时可见字段 12 个 → 索引 12）
         state.config_wizard.form_state.selected_field = 12;
         assert!(state.config_wizard.is_next_selected());
 
@@ -1379,6 +1397,18 @@ mod tests {
         assert_eq!(state.config_wizard.step, ConfigStep::ConfigForm);
         assert!(state.config_wizard.error_message.is_some());
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn test_preserve_standard_names_visible_only_when_unify_enabled() {
+        let mut state = state_for(Flow::CreateConfig, ConfigStep::ConfigForm);
+
+        // 未开启统一文件名：字段隐藏
+        assert!(!FormField::PreserveStandardNames.is_visible(&state.config_wizard));
+
+        // 开启统一文件名：字段显示
+        state.config_wizard.unify_filenames.select_by_index(1);
+        assert!(FormField::PreserveStandardNames.is_visible(&state.config_wizard));
     }
 
     #[test]

@@ -2,12 +2,67 @@
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
+use std::path::Path;
+use std::time::SystemTime;
 use winapi::ctypes::c_void;
+use winapi::shared::minwindef::FILETIME;
+use winapi::um::fileapi::SetFileTime;
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
 use winapi::um::shellapi::ShellExecuteW;
 use winapi::um::winnt::{HANDLE, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use winapi::um::winuser::SW_SHOW;
+
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+/// 把创建时间与修改时间写回文件（访问时间保持不变）。
+///
+/// `std::fs::FileTimes` 与 `filetime` 均不支持设置创建时间，
+/// 因此这里直接调用 WinAPI `SetFileTime`。
+pub fn set_file_times(path: &Path, times: &super::FileTimes) -> io::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let handle = file.as_raw_handle() as HANDLE;
+
+    let creation_ft = times.created.map(to_filetime);
+    let modified_ft = to_filetime(times.modified);
+
+    let ok = unsafe {
+        SetFileTime(
+            handle,
+            creation_ft
+                .as_ref()
+                .map_or(std::ptr::null(), |ft| ft as *const FILETIME),
+            std::ptr::null(),
+            &modified_ft as *const FILETIME,
+        )
+    };
+
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// `SystemTime` → `FILETIME`（自 1601-01-01 起 100ns 间隔计数）。
+fn to_filetime(time: SystemTime) -> FILETIME {
+    const UNIX_TO_FILETIME_TICKS: u64 = 116_444_736_000_000_000;
+    let since_epoch = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ticks = UNIX_TO_FILETIME_TICKS
+        + since_epoch.as_secs() * 10_000_000
+        + u64::from(since_epoch.subsec_nanos()) / 100;
+    FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    }
+}
 
 /// Check if the current process is running with administrator privileges.
 pub fn is_running_as_admin() -> bool {
@@ -116,4 +171,23 @@ pub fn elevate_for_symlink() -> io::Result<()> {
 /// Check if this process was started due to an elevation request.
 pub fn was_started_for_elevation() -> bool {
     std::env::args().any(|arg| arg == "--elevated-for-symlink")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_filetime_known_values() {
+        let unix_epoch = SystemTime::UNIX_EPOCH;
+        let ft = to_filetime(unix_epoch);
+        let ticks = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+        assert_eq!(ticks, 116_444_736_000_000_000);
+
+        // 2020-01-01 00:00:00 UTC
+        let known = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let ft = to_filetime(known);
+        let ticks = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+        assert_eq!(ticks, 132_223_104_000_000_000);
+    }
 }

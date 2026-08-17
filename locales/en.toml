@@ -149,18 +149,11 @@ field_file_operation = "File Operation"
 field_deduplication = "Deduplication"
 field_dry_run = "Dry Run"
 field_unify_filenames = "Unify Filenames"
+field_preserve_standard_names = "Preserve Standard Names"
 
 # Navigation
 go_to_summary = "Next: View Configuration Summary"
 
 # Filename Unification (Rename)
 summary_unify_filenames = "Unify Filenames:"
-unify_complete = "Filename Unification Complete!"
-unify_cancelled = "Filename unification cancelled - completed renames are kept"
-unify_renamed = "Renamed"
-unify_already_unified = "Already unified"
-unify_no_metadata = "No metadata (left unchanged)"
-unify_failed = "Failed"
-unify_unmodified_list_written = "Unmodified files list:"
-unify_no_unmodified = "No files were left unmodified."
-unify_dry_run_notice = "[DRY RUN] No filenames were actually changed."
+summary_preserve_standard_names = "Preserve Standard Names:"

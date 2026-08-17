@@ -11,7 +11,9 @@ Gallery Sorter 是一个结合 CLI 与 TUI 的照片/视频整理工具，基于
 - 灵活的分类方式：无分类/按年/按年月，月份支持嵌套或组合格式
 - 处理模式：增量（默认）、补充、完整
 - 并行处理、可配置线程数与试运行模式
-- 文件名统一化：基于 EXIF / FFprobe 元数据把文件名统一为 `YYYYMMDD_HHMMSS.ext`，无元数据的文件保持原名并输出未修改列表
+- 文件名统一化：基于 EXIF / FFprobe 元数据，把文件名统一为标准相机命名
+  （`MVIMG_`/`IMG_`/`VID_` + `YYYYMMDD_HHMMSS`），并随归档流程一起执行；
+  无元数据的文件保持原名并输出未修改列表
 - Ratatui 交互向导 + 完整 CLI 自动化
 - 中英文双语界面
 
@@ -72,8 +74,11 @@ gallery-sorter \
   --deduplicate \
   --dry-run
 
-# 文件名统一化（原地重命名，仅使用 EXIF / FFprobe 元数据）
-gallery-sorter --unify-filenames -i /path/to/photos
+# 文件名统一化（重命名 + 移动/复制到输出目录）
+gallery-sorter --unify-filenames --operation move -i /path/to/photos -o /path/to/sorted
+
+# 同时保留标准相机名称（MVIMG_/IMG_/VID_ + 时间戳格式）
+gallery-sorter --unify-filenames --preserve-standard-names -i /path/to/photos
 ```
 
 ### 命令行参数
@@ -93,7 +98,8 @@ gallery-sorter --unify-filenames -i /path/to/photos
 | `--threads` | `-t` | 线程数（0 = 自动） |
 | `--large-file-mb` |  | 大文件阈值（MB） |
 | `--dry-run` | `-n` | 试运行，仅预览 |
-| `--unify-filenames` |  | 基于 EXIF / FFprobe 元数据统一文件名（原地重命名） |
+| `--unify-filenames` |  | 基于 EXIF / FFprobe 元数据，在归档时按标准相机命名重命名文件 |
+| `--preserve-standard-names` |  | 保留标准相机名称（`MVIMG_`/`IMG_`/`VID_` + `_YYYYMMDD_HHMMSS` 格式）不修改 |
 | `--unmodified-list` |  | 未修改文件列表路径（默认 `<output_dir>/unmodified_files.txt`） |
 | `--verbose` | `-v` | 详细输出 |
 | `--json-log` |  | JSON 日志 |
@@ -101,12 +107,20 @@ gallery-sorter --unify-filenames -i /path/to/photos
 ### 文件名统一化
 
 `--unify-filenames` 会扫描输入目录中的媒体文件，仅从 EXIF（图片）或 FFprobe（视频）
-解析创建时间，并把文件名统一为 `YYYYMMDD_HHMMSS.ext`（例如 `IMG_20240115_143022.jpg`
-→ `20240115_143022.jpg`）。同一目录内目标名冲突时自动追加 `_1`、`_2` 后缀。
+解析创建时间，并把输出目录中的文件命名为标准相机格式：照片与 RAW 使用
+`IMG_YYYYMMDD_HHMMSS.ext`，动态照片（Motion Photo）使用 `MVIMG_YYYYMMDD_HHMMSS.ext`，
+视频使用 `VID_YYYYMMDD_HHMMSS.ext`。配置的操作（复制/移动/硬链接/符号链接）照常生效，
+因此文件会先重命名再放入输出目录。目标名冲突时自动追加 `_1`、`_2` 后缀。
 
-无法从元数据解析出时间的文件不会被修改，其路径会写入未修改列表文件（默认
-`<output_dir>/unmodified_files.txt`，可用 `--unmodified-list` 指定）。试运行模式
-（`--dry-run`）不会写入列表文件，也不会修改任何文件名。
+启用 `--preserve-standard-names` 后，只要文件名符合标准相机命名
+（以 `MVIMG_`、`IMG_` 或 `VID_` 开头，后接 `_年月日_时分秒`，时间之后
+无论接什么都算标准名称）就不会重命名（但仍会移动/复制到输出目录），
+也不会出现在未修改列表中。
+
+无法从元数据解析出时间的文件会保持原文件名（仍会按配置移动/复制到输出目录），
+其源路径会写入未修改列表文件（默认 `<output_dir>/unmodified_files.txt`，
+可用 `--unmodified-list` 指定）。试运行模式（`--dry-run`）不会写入列表文件，
+也不会执行任何操作。
 
 ## 配置文件
 
@@ -127,6 +141,7 @@ operation = "copy"
 deduplicate = true
 dry_run = false
 unify_filenames = false
+preserve_standard_names = false
 verbose = false
 ```
 
