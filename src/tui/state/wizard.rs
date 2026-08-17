@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 pub enum Effect {
     /// 加载指定配置文件（当前行为：加载后初始化表单并进入摘要）
     LoadConfig(PathBuf),
-    /// 保存配置（携带配置名称）
-    SaveConfig(String),
+    /// 保存配置（携带配置名称与配置快照，避免状态被重置后丢失内容）
+    SaveConfig { name: String, config: Box<Config> },
     /// 刷新配置列表
     RefreshConfigs,
     /// 启动处理（携带配置与配置名称）
@@ -150,11 +150,15 @@ pub fn transition(state: &mut AppState, event: TuiEvent) -> Vec<Effect> {
                         });
                     }
                 } else {
-                    // CreateConfig/RunDirect 在确认步骤始终保存配置
-                    effects.push(Effect::SaveConfig(state.config_wizard.config_name.clone()));
+                    // CreateConfig 在确认步骤始终保存配置：
+                    // 先快照配置再入队，避免后续 reset 清空表单后保存成默认值
+                    let config = state.config_wizard.build_config();
+                    effects.push(Effect::SaveConfig {
+                        name: state.config_wizard.config_name.clone(),
+                        config: Box::new(config.clone()),
+                    });
 
                     if selected == 0 {
-                        let config = state.config_wizard.build_config();
                         effects.push(Effect::RunProcessing {
                             config: Box::new(config),
                             config_name: Some(state.config_wizard.config_name.clone()),
@@ -1185,7 +1189,7 @@ mod tests {
             .iter()
             .map(|effect| match effect {
                 Effect::LoadConfig(_) => EffectKind::LoadConfig,
-                Effect::SaveConfig(_) => EffectKind::SaveConfig,
+                Effect::SaveConfig { .. } => EffectKind::SaveConfig,
                 Effect::RefreshConfigs => EffectKind::RefreshConfigs,
                 Effect::RunProcessing { config_name, .. } => EffectKind::RunProcessing {
                     has_name: config_name.is_some(),
@@ -1369,6 +1373,28 @@ mod tests {
 
         assert_eq!(effect_kinds(&effects), vec![EffectKind::SaveConfig]);
         assert_eq!(state.current_screen, Screen::MainMenu);
+    }
+
+    #[test]
+    fn test_create_config_confirm_run_decline_saves_config_snapshot() {
+        let mut state = state_for(Flow::CreateConfig, ConfigStep::ConfirmRun);
+        state.config_wizard.config_name = "album".to_string();
+        state.config_wizard.input_dirs = "D:/photos".to_string();
+        state.config_wizard.output_dir = "D:/sorted".to_string();
+        state.config_wizard.set_selected(1);
+
+        let effects = transition(&mut state, TuiEvent::Enter);
+
+        // reset 会清空向导状态，但 SaveConfig 效果必须携带填写时的配置快照
+        assert_eq!(state.current_screen, Screen::MainMenu);
+        match &effects[0] {
+            Effect::SaveConfig { name, config } => {
+                assert_eq!(name, "album");
+                assert_eq!(config.input_dirs, vec![PathBuf::from("D:/photos")]);
+                assert_eq!(config.output_dir, PathBuf::from("D:/sorted"));
+            }
+            other => panic!("expected SaveConfig effect, got {other:?}"),
+        }
     }
 
     #[test]

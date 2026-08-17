@@ -69,6 +69,22 @@ dry_run = false
 # Verbose output - show detailed processing information
 verbose = false
 
+# Unify filenames based on EXIF / FFprobe metadata while organizing.
+# Photos/RAW become IMG_YYYYMMDD_HHMMSS, dynamic photos MVIMG_YYYYMMDD_HHMMSS,
+# videos VID_YYYYMMDD_HHMMSS; when metadata contains milliseconds the names
+# keep the millisecond part (IMG_YYYYMMDD_HHMMSSfff). Files without metadata
+# keep their names and are written to the unmodified files list.
+unify_filenames = false
+
+# Preserve standard camera names in rename mode.
+# Files starting with MVIMG_/IMG_/VID_ followed by _YYYYMMDD_HHMMSS
+# (anything after the timestamp is allowed) are left unchanged.
+preserve_standard_names = false
+
+# Custom path for the unmodified files list (rename mode)
+# Default: <output_dir>/unmodified_files.txt
+# unmodified_list_file = "D:/Reports/unmodified_files.txt"
+
 # Supported file extensions (customize as needed)
 # EXIF extraction supported: jpg, jpeg, png, webp, heic, heif, avif, tiff, tif
 image_extensions = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "heif", "avif", "tiff", "tif"]

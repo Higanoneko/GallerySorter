@@ -167,8 +167,10 @@ impl TuiApp {
                         self.state.config_wizard.error_message = Some(err.to_string());
                     }
                 },
-                Effect::SaveConfig(name) => {
-                    let _ = self.save_config_to_disk(&name);
+                Effect::SaveConfig { name, config } => {
+                    if let Err(err) = self.save_config_to_disk(&name, &config) {
+                        tracing::error!(config_name = %name, error = %err, "Failed to save config file");
+                    }
                 }
                 Effect::RefreshConfigs => {
                     self.refresh_configs_from_disk();
@@ -197,7 +199,7 @@ impl TuiApp {
     }
 
     /// 保存配置到磁盘（含 current_exe() 路径解析，IO 边缘执行）
-    fn save_config_to_disk(&mut self, name: &str) -> Result<PathBuf, String> {
+    fn save_config_to_disk(&mut self, name: &str, config: &Config) -> Result<PathBuf, String> {
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -208,8 +210,7 @@ impl TuiApp {
             .map_err(|e| format!("Failed to create config directory: {}", e))?;
 
         let config_path = config_dir.join(name).with_extension("toml");
-        let config = self.state.config_wizard.build_config();
-        let content = toml::to_string_pretty(&config)
+        let content = toml::to_string_pretty(config)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
         std::fs::write(&config_path, content)
