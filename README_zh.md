@@ -110,7 +110,10 @@ gallery-sorter --unify-filenames --preserve-standard-names -i /path/to/photos
 解析创建时间，并把输出目录中的文件命名为标准相机格式：照片与 RAW 使用
 `IMG_YYYYMMDD_HHMMSS.ext`，动态照片（Motion Photo）使用 `MVIMG_YYYYMMDD_HHMMSS.ext`，
 视频使用 `VID_YYYYMMDD_HHMMSS.ext`。配置的操作（复制/移动/硬链接/符号链接）照常生效，
-因此文件会先重命名再放入输出目录。目标名冲突时自动追加 `_1`、`_2` 后缀。
+因此文件会先重命名再放入输出目录。当 EXIF/FFprobe 元数据含有毫秒时，
+文件名保留毫秒段（`IMG_YYYYMMDD_HHMMSSfff.ext`）；没有毫秒时，
+同一秒的重名文件自动追加 `_1`、`_2` 后缀。所有目标名都会在复制/移动/链接
+之前确定并预占，同名文件不会互相覆盖。
 
 启用 `--preserve-standard-names` 后，只要文件名符合标准相机命名
 （以 `MVIMG_`、`IMG_` 或 `VID_` 开头，后接 `_年月日_时分秒`，时间之后

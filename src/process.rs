@@ -448,8 +448,8 @@ impl Processor {
             return Ok(Vec::new());
         }
 
-        // Phase 3: Process files
-        info!("Processing files...");
+        // Phase 3: 先“重命名分析”（提取时间 / 构建目标 / 冲突预占），再执行文件操作
+        info!("Planning destinations before executing file operations...");
 
         // Wrap state in Arc<Mutex> for shared access
         let state = Arc::new(Mutex::new(std::mem::take(&mut self.state)));
@@ -464,17 +464,63 @@ impl Processor {
         let hash_to_best_file = Arc::new(hash_to_best_file);
         let existing_hashes = Arc::new(existing_hashes);
 
-        // Process all files, marking duplicates appropriately
-        let results: Vec<FileResult> = files
+        // Phase 3a：并行分析（时间提取 / 去重 / 基础目标路径），不修改磁盘
+        info!("Analyzing files and extracting metadata...");
+        let preplans: Vec<PrePlan> = files
             .par_iter()
             .map(|file_path| {
-                let _file_span = span!(Level::DEBUG, "process_file", ?file_path).entered();
+                let _file_span = span!(Level::DEBUG, "plan_file", ?file_path).entered();
 
                 // 每文件处理前检查取消标志（ADR-0003 检查点语义）
                 if cancel.load(Ordering::Relaxed) {
                     debug!(?file_path, "File not processed due to cancellation");
-                    return FileResult {
+                    return PrePlan::Cancelled(file_path.clone());
+                }
+
+                // 同名内容重复（Phase 2 已选保留文件）→ 标记为重复，稍后统一报告目标
+                if !files_to_process.contains(file_path) {
+                    let hash = file_hash_map.get(file_path).and_then(|h| *h);
+                    return PrePlan::Duplicate {
                         source: file_path.clone(),
+                        hash,
+                        existing_dest: None,
+                        time_info: None,
+                    };
+                }
+
+                preplan_single_file(file_path, &config, &state, &file_hash_map, &existing_hashes)
+            })
+            .collect();
+
+        // Phase 3b：顺序“重命名分析”——冲突解析 + 目标预占。
+        // 所有目标名在复制/移动/链接之前确定并预占，同批同名文件不再互相覆盖。
+        info!("Resolving destination conflicts...");
+        let mut occupied: HashMap<PathBuf, Option<u64>> = HashMap::new();
+        let plans: Vec<PlannedFile> = preplans
+            .into_iter()
+            .map(|pre| {
+                plan_single_file(
+                    pre,
+                    &config,
+                    &hash_to_dest,
+                    &hash_to_best_file,
+                    &mut occupied,
+                )
+            })
+            .collect();
+
+        // Phase 3c：并行执行文件操作（复制/移动/链接），目标路径已在分析阶段锁定
+        info!("Executing file operations...");
+        let results: Vec<FileResult> = plans
+            .into_par_iter()
+            .map(|plan| {
+                let _file_span = span!(Level::DEBUG, "process_file", ?plan.source).entered();
+
+                // 每文件执行前检查取消标志（ADR-0003 检查点语义）
+                if cancel.load(Ordering::Relaxed) {
+                    debug!(source = ?plan.source, "File not processed due to cancellation");
+                    return FileResult {
+                        source: plan.source,
                         destination: None,
                         time_info: None,
                         status: ProcessingStatus::Cancelled,
@@ -482,42 +528,7 @@ impl Processor {
                     };
                 }
 
-                // Check if this is a duplicate that should be skipped
-                if !files_to_process.contains(file_path) {
-                    // Find the hash for this file to get the kept file's destination
-                    if let Some(Some(hash)) = file_hash_map.get(file_path) {
-                        // Get destination from already-processed best file, or report the best file path
-                        let dest = {
-                            let dest_map = hash_to_dest.lock().unwrap();
-                            dest_map.get(hash).cloned()
-                        }
-                        .or_else(|| hash_to_best_file.get(hash).cloned());
-
-                        info!(
-                            ?file_path,
-                            ?dest,
-                            "Skipping duplicate file (inferior filename)"
-                        );
-                        stats.duplicates.fetch_add(1, Ordering::Relaxed);
-                        return FileResult {
-                            source: file_path.clone(),
-                            destination: dest,
-                            time_info: None,
-                            status: ProcessingStatus::Duplicate,
-                            error: None,
-                        };
-                    }
-                }
-
-                process_single_file(
-                    file_path,
-                    &config,
-                    &state,
-                    &stats,
-                    &hash_to_dest,
-                    &file_hash_map,
-                    &existing_hashes,
-                )
+                execute_planned_file(plan, &config, &state, &stats)
             })
             .collect();
 
@@ -695,18 +706,61 @@ impl Processor {
     }
 }
 
-/// Process a single file (standalone function for parallel processing)
-fn process_single_file(
+/// 单个文件在“分析”阶段的中间结果（不修改磁盘）。
+enum PrePlan {
+    /// 取消：未开始分析
+    Cancelled(PathBuf),
+    /// 跳过（Supplement 已存在 / 增量状态已处理）
+    Skipped(PathBuf),
+    /// 重复文件（同批内容重复或状态库命中）
+    Duplicate {
+        source: PathBuf,
+        hash: Option<u64>,
+        /// 状态库中已存在的目标（同批重复时为 `None`，稍后查规划表）
+        existing_dest: Option<PathBuf>,
+        time_info: Option<ExtractedTime>,
+    },
+    /// 分析失败（无元数据 / 目标路径构建失败）
+    Failed {
+        source: PathBuf,
+        error: String,
+        time_info: Option<ExtractedTime>,
+    },
+    /// 需要进入“重命名分析”：已提取时间并构建基础目标路径
+    Pending {
+        source: PathBuf,
+        content_hash: Option<u64>,
+        time_info: ExtractedTime,
+        base_dest: PathBuf,
+    },
+}
+
+/// 单个文件在“重命名分析”后的执行计划。
+struct PlannedFile {
+    source: PathBuf,
+    destination: Option<PathBuf>,
+    time_info: Option<ExtractedTime>,
+    status: ProcessingStatus,
+    error: Option<String>,
+    content_hash: Option<u64>,
+    /// 是否需要在执行阶段真正写入（复制/移动/链接）。
+    /// 目标已存在相同内容（Full 计成功、不写入）时为 `false`。
+    needs_write: bool,
+}
+
+/// Phase 3a：并行分析单个文件（时间提取 / 去重 / 基础目标路径）。
+///
+/// 本阶段不修改磁盘，也不做目标冲突解析——冲突解析统一放到
+/// 顺序的“重命名分析”阶段（Phase 3b），保证复制/移动/链接前目标名唯一。
+fn preplan_single_file(
     path: &Path,
     config: &Arc<Config>,
     state: &Arc<Mutex<ProcessingState>>,
-    stats: &Arc<ProcessingStats>,
-    hash_to_dest: &Arc<Mutex<HashMap<u64, PathBuf>>>,
     file_hash_map: &HashMap<PathBuf, Option<u64>>,
     existing_hashes: &Arc<HashSet<u64>>,
-) -> FileResult {
+) -> PrePlan {
     // Get content hash from pre-computed map (needed for Supplement mode check)
-    let content_hash = file_hash_map.get(&path.to_path_buf()).and_then(|h| *h);
+    let content_hash = file_hash_map.get(path).and_then(|h| *h);
 
     // Supplement mode: skip if file hash already exists in target directory
     if config.processing_mode == ProcessingMode::Supplement
@@ -717,14 +771,7 @@ fn process_single_file(
             ?path,
             "File already exists in target (Supplement mode), skipping"
         );
-        stats.skipped.fetch_add(1, Ordering::Relaxed);
-        return FileResult {
-            source: path.to_path_buf(),
-            destination: None,
-            time_info: None,
-            status: ProcessingStatus::Skipped,
-            error: None,
-        };
+        return PrePlan::Skipped(path.to_path_buf());
     }
 
     // Check if file needs processing (incremental mode)
@@ -734,14 +781,7 @@ fn process_single_file(
                 let state_guard = state.lock().unwrap();
                 if !state_guard.needs_processing(path, metadata_hash) {
                     debug!(?path, "File already processed, skipping");
-                    stats.skipped.fetch_add(1, Ordering::Relaxed);
-                    return FileResult {
-                        source: path.to_path_buf(),
-                        destination: None,
-                        time_info: None,
-                        status: ProcessingStatus::Skipped,
-                        error: None,
-                    };
+                    return PrePlan::Skipped(path.to_path_buf());
                 }
             }
             Err(e) => {
@@ -755,13 +795,10 @@ fn process_single_file(
         Ok(info) => info,
         Err(e) => {
             error!(?path, error = %e, "Failed to extract time");
-            stats.failed.fetch_add(1, Ordering::Relaxed);
-            return FileResult {
+            return PrePlan::Failed {
                 source: path.to_path_buf(),
-                destination: None,
+                error: e.to_string(),
                 time_info: None,
-                status: ProcessingStatus::Failed,
-                error: Some(e.to_string()),
             };
         }
     };
@@ -773,240 +810,357 @@ fn process_single_file(
         let state_guard = state.lock().unwrap();
         if let Some(existing) = state_guard.has_content_hash(hash) {
             info!(?path, ?existing, "Duplicate file detected (from state)");
-            stats.duplicates.fetch_add(1, Ordering::Relaxed);
-            return FileResult {
+            return PrePlan::Duplicate {
                 source: path.to_path_buf(),
-                destination: Some(existing.clone()),
+                hash: Some(hash),
+                existing_dest: Some(existing.clone()),
                 time_info: Some(time_info),
-                status: ProcessingStatus::Duplicate,
-                error: None,
             };
         }
     }
 
     // Build base destination path (without conflict resolution)
-    let base_dest_path = match build_base_destination_path(path, &time_info, config) {
+    let base_dest = match build_base_destination_path(path, &time_info, config) {
         Ok(p) => p,
         Err(e) => {
             error!(?path, error = %e, "Failed to build destination path");
-            stats.failed.fetch_add(1, Ordering::Relaxed);
-            return FileResult {
+            return PrePlan::Failed {
                 source: path.to_path_buf(),
-                destination: None,
+                error: e.to_string(),
                 time_info: Some(time_info),
-                status: ProcessingStatus::Failed,
-                error: Some(e.to_string()),
             };
         }
     };
 
-    // Check if destination already exists with the same content
-    // Behavior depends on processing mode:
-    // - Full mode: overwrite (use base path, don't add suffix)
-    // - Supplement/Incremental mode: skip if same content already exists
-    let dest_path = if base_dest_path.exists() {
-        if let Some(source_hash) = content_hash {
-            if let Ok(dest_hash) = compute_file_hash(&base_dest_path, config.large_file_threshold) {
-                if source_hash == dest_hash {
-                    match config.processing_mode {
-                        ProcessingMode::Full => {
-                            // Full mode: file is identical, still "process" it
-                            // (actually just skip the copy but count as processed for user expectation)
-                            debug!(
-                                ?path,
-                                ?base_dest_path,
-                                "File already exists with identical content (Full mode - counting as processed)"
-                            );
-                            stats.processed.fetch_add(1, Ordering::Relaxed);
-                            return FileResult {
-                                source: path.to_path_buf(),
-                                destination: Some(base_dest_path),
-                                time_info: Some(time_info),
-                                status: ProcessingStatus::Success,
-                                error: None,
-                            };
-                        }
-                        ProcessingMode::Supplement | ProcessingMode::Incremental => {
-                            // Supplement/Incremental: skip file with same content
-                            info!(
-                                ?path,
-                                ?base_dest_path,
-                                "Skipping file - destination already exists with identical content"
-                            );
-                            stats.skipped.fetch_add(1, Ordering::Relaxed);
-                            return FileResult {
-                                source: path.to_path_buf(),
-                                destination: Some(base_dest_path),
-                                time_info: Some(time_info),
-                                status: ProcessingStatus::Skipped,
-                                error: None,
-                            };
-                        }
-                    }
-                } else {
-                    // Different content - behavior by mode
-                    match config.processing_mode {
-                        ProcessingMode::Full => {
-                            // Full mode: overwrite existing file (use base path)
-                            debug!(
-                                ?path,
-                                ?base_dest_path,
-                                "Overwriting existing file (Full mode)"
-                            );
-                            base_dest_path
-                        }
-                        ProcessingMode::Supplement | ProcessingMode::Incremental => {
-                            // Add suffix to avoid overwriting
-                            match resolve_filename_conflict(base_dest_path) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    error!(?path, error = %e, "Failed to resolve filename conflict");
-                                    stats.failed.fetch_add(1, Ordering::Relaxed);
-                                    return FileResult {
-                                        source: path.to_path_buf(),
-                                        destination: None,
-                                        time_info: Some(time_info),
-                                        status: ProcessingStatus::Failed,
-                                        error: Some(e.to_string()),
-                                    };
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Couldn't compute dest hash, resolve conflict normally
-                match config.processing_mode {
-                    ProcessingMode::Full => base_dest_path,
-                    _ => match resolve_filename_conflict(base_dest_path) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            error!(?path, error = %e, "Failed to resolve filename conflict");
-                            stats.failed.fetch_add(1, Ordering::Relaxed);
-                            return FileResult {
-                                source: path.to_path_buf(),
-                                destination: None,
-                                time_info: Some(time_info),
-                                status: ProcessingStatus::Failed,
-                                error: Some(e.to_string()),
-                            };
-                        }
-                    },
-                }
+    PrePlan::Pending {
+        source: path.to_path_buf(),
+        content_hash,
+        time_info,
+        base_dest,
+    }
+}
+
+/// Phase 3b：顺序“重命名分析”——把中间结果转换为执行计划。
+///
+/// 所有可能写入的目标路径在此阶段预占（`occupied` 记录内容哈希），
+/// 因此同批文件即使基础目标同名，也会在复制/移动/链接之前分配到唯一目标。
+fn plan_single_file(
+    pre: PrePlan,
+    config: &Arc<Config>,
+    hash_to_dest: &Arc<Mutex<HashMap<u64, PathBuf>>>,
+    hash_to_best_file: &Arc<HashMap<u64, PathBuf>>,
+    occupied: &mut HashMap<PathBuf, Option<u64>>,
+) -> PlannedFile {
+    match pre {
+        PrePlan::Cancelled(source) => PlannedFile {
+            source,
+            destination: None,
+            time_info: None,
+            status: ProcessingStatus::Cancelled,
+            error: None,
+            content_hash: None,
+            needs_write: false,
+        },
+        PrePlan::Skipped(source) => PlannedFile {
+            source,
+            destination: None,
+            time_info: None,
+            status: ProcessingStatus::Skipped,
+            error: None,
+            content_hash: None,
+            needs_write: false,
+        },
+        PrePlan::Duplicate {
+            source,
+            hash,
+            existing_dest,
+            time_info,
+        } => {
+            // 同批重复：优先报告保留文件已规划的目标，其次回退到保留文件源路径
+            let dest = existing_dest
+                .or_else(|| hash.and_then(|h| hash_to_dest.lock().unwrap().get(&h).cloned()))
+                .or_else(|| hash.and_then(|h| hash_to_best_file.get(&h).cloned()));
+            PlannedFile {
+                source,
+                destination: dest,
+                time_info,
+                status: ProcessingStatus::Duplicate,
+                error: None,
+                content_hash: hash,
+                needs_write: false,
             }
-        } else {
-            // No source hash available, resolve conflict normally
-            match config.processing_mode {
-                ProcessingMode::Full => base_dest_path,
-                _ => match resolve_filename_conflict(base_dest_path) {
+        }
+        PrePlan::Failed {
+            source,
+            error,
+            time_info,
+        } => PlannedFile {
+            source,
+            destination: None,
+            time_info,
+            status: ProcessingStatus::Failed,
+            error: Some(error),
+            content_hash: None,
+            needs_write: false,
+        },
+        PrePlan::Pending {
+            source,
+            content_hash,
+            time_info,
+            base_dest,
+        } => {
+            let (dest, needs_write) =
+                match plan_destination(content_hash, base_dest, config, occupied) {
                     Ok(p) => p,
                     Err(e) => {
-                        error!(?path, error = %e, "Failed to resolve filename conflict");
-                        stats.failed.fetch_add(1, Ordering::Relaxed);
-                        return FileResult {
-                            source: path.to_path_buf(),
+                        error!(?source, error = %e, "Failed to resolve filename conflict");
+                        return PlannedFile {
+                            source,
                             destination: None,
                             time_info: Some(time_info),
                             status: ProcessingStatus::Failed,
                             error: Some(e.to_string()),
+                            content_hash,
+                            needs_write: false,
                         };
                     }
-                },
+                };
+
+            let status = if needs_write {
+                ProcessingStatus::Success
+            } else {
+                match config.processing_mode {
+                    ProcessingMode::Full => ProcessingStatus::Success,
+                    _ => ProcessingStatus::Skipped,
+                }
+            };
+
+            // 会写入（或试运行预览）的文件记录 hash → 目标，供同批重复文件报告
+            if status == ProcessingStatus::Success
+                && let Some(hash) = content_hash
+            {
+                hash_to_dest.lock().unwrap().insert(hash, dest.clone());
+            }
+
+            PlannedFile {
+                source,
+                destination: Some(dest),
+                time_info: Some(time_info),
+                status,
+                error: None,
+                content_hash,
+                needs_write,
             }
         }
-    } else {
-        // Destination doesn't exist, use base path
-        base_dest_path
-    };
+    }
+}
 
-    // Handle dry run
-    if config.dry_run {
-        info!(
-            source = ?path,
-            destination = ?dest_path,
-            time_source = ?time_info.source,
-            "Would process file"
-        );
+/// 在“重命名分析”阶段决定最终目标并预占路径。
+///
+/// 返回 `(目标路径, 本次运行是否需要写入)`：
+/// - 目标在磁盘或已被本次运行预占且内容相同 → 不写入
+///   （Full 模式按成功计，Supplement/Incremental 按跳过计，由调用方决定状态）；
+/// - 其余情况（不同内容 / 无法比较 / 目标不存在）→ 追加 `_N` 序号或直接使用，
+///   并预占目标，避免同批文件在并行执行时互相覆盖。
+fn plan_destination(
+    content_hash: Option<u64>,
+    base_dest: PathBuf,
+    config: &Config,
+    occupied: &mut HashMap<PathBuf, Option<u64>>,
+) -> Result<(PathBuf, bool)> {
+    // 本次运行已预占同一目标（尚未落盘）：按内容哈希判定“相同内容”或冲突
+    if let Some(occupier_hash) = occupied.get(&base_dest).copied() {
+        if let (Some(a), Some(b)) = (content_hash, occupier_hash)
+            && a == b
+        {
+            return Ok((base_dest, false));
+        }
+        // 不同内容（或无法比较）：为避免同批互相覆盖，追加序号
+        let resolved = resolve_filename_conflict_with(base_dest, occupied)?;
+        occupied.insert(resolved.clone(), content_hash);
+        return Ok((resolved, true));
+    }
 
-        // Record destination for duplicate reporting
-        if let Some(hash) = content_hash {
-            let mut dest_map = hash_to_dest.lock().unwrap();
-            dest_map.insert(hash, dest_path.clone());
+    if base_dest.exists() {
+        if let Some(source_hash) = content_hash
+            && let Ok(dest_hash) = compute_file_hash(&base_dest, config.large_file_threshold)
+            && source_hash == dest_hash
+        {
+            return Ok((base_dest, false));
         }
 
-        stats.processed.fetch_add(1, Ordering::Relaxed);
-        return FileResult {
-            source: path.to_path_buf(),
-            destination: Some(dest_path),
-            time_info: Some(time_info),
-            status: ProcessingStatus::DryRun,
+        // 磁盘已有不同内容 / 无法比较：Full 覆盖，其他模式追加序号
+        if config.processing_mode == ProcessingMode::Full {
+            occupied.insert(base_dest.clone(), content_hash);
+            return Ok((base_dest, true));
+        }
+        let resolved = resolve_filename_conflict_with(base_dest, occupied)?;
+        occupied.insert(resolved.clone(), content_hash);
+        return Ok((resolved, true));
+    }
+
+    // 目标不存在 → 直接预占
+    occupied.insert(base_dest.clone(), content_hash);
+    Ok((base_dest, true))
+}
+
+/// Phase 3c：按已锁定的执行计划并行执行文件操作（复制/移动/链接）。
+///
+/// 目标路径在分析阶段已唯一，执行阶段不再做任何改名决策。
+fn execute_planned_file(
+    plan: PlannedFile,
+    config: &Arc<Config>,
+    state: &Arc<Mutex<ProcessingState>>,
+    stats: &Arc<ProcessingStats>,
+) -> FileResult {
+    match plan.status {
+        ProcessingStatus::Success => {
+            let source = plan.source;
+            let dest = plan.destination.clone().unwrap_or_else(|| source.clone());
+
+            // 目标已存在相同内容：不写入，按成功计（保持原有 Full 模式语义）
+            if !plan.needs_write {
+                debug!(
+                    ?source,
+                    ?dest,
+                    "File already exists with identical content (Full mode - counting as processed)"
+                );
+                stats.processed.fetch_add(1, Ordering::Relaxed);
+                return FileResult {
+                    source,
+                    destination: Some(dest),
+                    time_info: plan.time_info,
+                    status: ProcessingStatus::Success,
+                    error: None,
+                };
+            }
+
+            // Handle dry run
+            if config.dry_run {
+                info!(
+                    source = ?source,
+                    destination = ?dest,
+                    time_source = ?plan.time_info.as_ref().map(|t| t.source),
+                    "Would process file"
+                );
+                stats.processed.fetch_add(1, Ordering::Relaxed);
+                return FileResult {
+                    source,
+                    destination: Some(dest),
+                    time_info: plan.time_info,
+                    status: ProcessingStatus::DryRun,
+                    error: None,
+                };
+            }
+
+            // Perform the file operation
+            if let Err(e) = perform_file_operation(&source, &dest, config) {
+                error!(?source, ?dest, error = %e, "Failed to process file");
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                return FileResult {
+                    source,
+                    destination: Some(dest),
+                    time_info: plan.time_info,
+                    status: ProcessingStatus::Failed,
+                    error: Some(e.to_string()),
+                };
+            }
+
+            // Update state
+            if config.processing_mode == ProcessingMode::Incremental
+                && let (Ok(metadata_hash), Some(content_hash)) =
+                    (compute_metadata_hash(&source), plan.content_hash)
+            {
+                let mut state_guard = state.lock().unwrap();
+                state_guard.record_processed(
+                    source.clone(),
+                    dest.clone(),
+                    content_hash,
+                    metadata_hash,
+                );
+            }
+
+            info!(
+                source = ?source,
+                destination = ?dest,
+                time_source = ?plan.time_info.as_ref().map(|t| t.source),
+                timestamp = ?plan.time_info.as_ref().map(|t| t.timestamp),
+                "Processed file"
+            );
+            stats.processed.fetch_add(1, Ordering::Relaxed);
+
+            FileResult {
+                source,
+                destination: Some(dest),
+                time_info: plan.time_info,
+                status: ProcessingStatus::Success,
+                error: None,
+            }
+        }
+        ProcessingStatus::Skipped => {
+            debug!(source = ?plan.source, "Skipping file");
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            FileResult {
+                source: plan.source,
+                destination: plan.destination,
+                time_info: plan.time_info,
+                status: ProcessingStatus::Skipped,
+                error: None,
+            }
+        }
+        ProcessingStatus::Duplicate => {
+            info!(
+                source = ?plan.source,
+                destination = ?plan.destination,
+                "Skipping duplicate file (inferior filename)"
+            );
+            stats.duplicates.fetch_add(1, Ordering::Relaxed);
+            FileResult {
+                source: plan.source,
+                destination: plan.destination,
+                time_info: plan.time_info,
+                status: ProcessingStatus::Duplicate,
+                error: None,
+            }
+        }
+        ProcessingStatus::Failed => {
+            stats.failed.fetch_add(1, Ordering::Relaxed);
+            FileResult {
+                source: plan.source,
+                destination: plan.destination,
+                time_info: plan.time_info,
+                status: ProcessingStatus::Failed,
+                error: plan.error,
+            }
+        }
+        ProcessingStatus::Cancelled => FileResult {
+            source: plan.source,
+            destination: None,
+            time_info: None,
+            status: ProcessingStatus::Cancelled,
             error: None,
-        };
-    }
-
-    // Perform the file operation
-    if let Err(e) = perform_file_operation(path, &dest_path, config) {
-        error!(?path, ?dest_path, error = %e, "Failed to process file");
-        stats.failed.fetch_add(1, Ordering::Relaxed);
-        return FileResult {
-            source: path.to_path_buf(),
-            destination: Some(dest_path),
-            time_info: Some(time_info),
-            status: ProcessingStatus::Failed,
-            error: Some(e.to_string()),
-        };
-    }
-
-    // Record destination for duplicate reporting
-    if let Some(hash) = content_hash {
-        let mut dest_map = hash_to_dest.lock().unwrap();
-        dest_map.insert(hash, dest_path.clone());
-    }
-
-    // Update state
-    if config.processing_mode == ProcessingMode::Incremental
-        && let (Ok(metadata_hash), Some(content_hash)) = (compute_metadata_hash(path), content_hash)
-    {
-        let mut state_guard = state.lock().unwrap();
-        state_guard.record_processed(
-            path.to_path_buf(),
-            dest_path.clone(),
-            content_hash,
-            metadata_hash,
-        );
-    }
-
-    info!(
-        source = ?path,
-        destination = ?dest_path,
-        time_source = ?time_info.source,
-        timestamp = %time_info.timestamp,
-        "Processed file"
-    );
-    stats.processed.fetch_add(1, Ordering::Relaxed);
-
-    FileResult {
-        source: path.to_path_buf(),
-        destination: Some(dest_path),
-        time_info: Some(time_info),
-        status: ProcessingStatus::Success,
-        error: None,
+        },
+        // 分析阶段不会产生 DryRun 计划；这里兜底直接返回（不应到达）
+        ProcessingStatus::DryRun => FileResult {
+            source: plan.source,
+            destination: plan.destination,
+            time_info: plan.time_info,
+            status: ProcessingStatus::DryRun,
+            error: plan.error,
+        },
     }
 }
 
-/// Resolve filename conflicts by adding a numeric suffix
-fn resolve_filename_conflict(path: PathBuf) -> Result<PathBuf> {
-    resolve_filename_conflict_with(path, &HashSet::new())
-}
-
-/// 与 [`resolve_filename_conflict`] 相同，但额外考虑本次运行中已占用的目标路径。
+/// 按序号解析文件名冲突：优先返回磁盘不存在且未被本次运行预占的路径，
+/// 否则追加 `_1`/`_2` 序号（最大 9999）。
 ///
 /// 用于文件名统一化等需要在“目标尚未落盘”时预占路径的场景（如试运行）。
+/// `occupied` 记录目标 → 内容哈希（`None` 表示调用方未提供内容哈希）。
 pub(crate) fn resolve_filename_conflict_with(
     mut path: PathBuf,
-    occupied: &HashSet<PathBuf>,
+    occupied: &HashMap<PathBuf, Option<u64>>,
 ) -> Result<PathBuf> {
-    if !path.exists() && !occupied.contains(&path) {
+    if !path.exists() && !occupied.contains_key(&path) {
         return Ok(path);
     }
 
@@ -1027,7 +1181,7 @@ pub(crate) fn resolve_filename_conflict_with(
     for i in 1..10000 {
         let new_name = format!("{}_{}{}", stem, i, extension);
         path = parent.join(new_name);
-        if !path.exists() && !occupied.contains(&path) {
+        if !path.exists() && !occupied.contains_key(&path) {
             return Ok(path);
         }
     }
@@ -1233,6 +1387,71 @@ mod tests {
         bytes
     }
 
+    /// 构造带 DateTimeOriginal + SubSecTimeOriginal 的最小 JPEG（毫秒信息）
+    fn exif_jpeg_with_subsec(datetime: &str, subsec: &str) -> Vec<u8> {
+        let dt_len = (datetime.len() + 1) as u32; // 含 NUL
+        let sub_len = (subsec.len() + 1) as u32; // 含 NUL
+        // ASCII 值 ≤ 4 字节（含 NUL）时按 TIFF 规则内联在条目中，不写偏移
+        let sub_inline = sub_len <= 4;
+        let exif_ifd_offset = 0x1A;
+        let dt_offset = exif_ifd_offset + 2 + 24 + 4; // count(2) + 2 entries(24) + next(4)
+        let sub_offset = if sub_inline { 0 } else { dt_offset + dt_len };
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"Exif\0\0");
+        payload.extend_from_slice(b"II\x2A\x00\x08\x00\x00\x00");
+        // IFD0（offset 8）：1 个 ExifIFDPointer 条目 → Exif 子 IFD 位于 0x1A
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&0x8769u16.to_le_bytes());
+        payload.extend_from_slice(&4u16.to_le_bytes()); // LONG
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&exif_ifd_offset.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+        // Exif 子 IFD：2 个条目（DateTimeOriginal + SubSecTimeOriginal）
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(&0x9003u16.to_le_bytes());
+        payload.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+        payload.extend_from_slice(&dt_len.to_le_bytes());
+        payload.extend_from_slice(&dt_offset.to_le_bytes());
+        payload.extend_from_slice(&0x9291u16.to_le_bytes());
+        payload.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+        payload.extend_from_slice(&sub_len.to_le_bytes());
+        if sub_inline {
+            let mut inline = [0u8; 4];
+            inline[..subsec.len()].copy_from_slice(subsec.as_bytes());
+            payload.extend_from_slice(&inline);
+        } else {
+            payload.extend_from_slice(&sub_offset.to_le_bytes());
+        }
+        payload.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+
+        payload.extend_from_slice(datetime.as_bytes());
+        payload.push(0);
+        if !sub_inline {
+            payload.extend_from_slice(subsec.as_bytes());
+            payload.push(0);
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        bytes.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        bytes.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        bytes
+    }
+
+    /// 在 EXIF APP1 段末尾追加填充字节（不影响 TIFF 解析），使同时间戳文件内容哈希不同
+    fn exif_jpeg_with_padding(datetime: &str, padding: u8) -> Vec<u8> {
+        let mut bytes = exif_jpeg(datetime);
+        let insert_at = bytes.len() - 2; // EOI 之前
+        bytes.insert(insert_at, padding);
+        // 更新 APP1 段长度字段（位于 SOI[0..2] + 标记[2..4] 之后）
+        let seg_len = bytes.len() - 4;
+        bytes[4..6].copy_from_slice(&(seg_len as u16).to_be_bytes());
+        bytes
+    }
+
     /// 在 EXIF JPEG 前追加 XMP Motion Photo 标记段（用于动态照片识别）
     fn exif_motion_jpeg(datetime: &str) -> Vec<u8> {
         let xmp_payload =
@@ -1408,6 +1627,87 @@ mod tests {
         assert!(input.join("DSC_0001.jpg").exists());
         assert!(!output.join("IMG_20240115_143000.jpg").exists());
         assert!(!output.join("unmodified_files.txt").exists());
+    }
+
+    #[test]
+    fn test_unify_filenames_same_second_parallel_keeps_all_files() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+
+        // 三张同一秒（无毫秒）但内容不同的照片：
+        // 重命名分析必须预占唯一目标，并行执行时不得互相覆盖（回归：文件丢失）
+        for i in 1..=3 {
+            fs::write(
+                input.join(format!("DSC_{:04}.jpg", i)),
+                exif_jpeg_with_padding("2024:01:15 14:30:00", i),
+            )
+            .unwrap();
+        }
+
+        let config = Config {
+            threads: 4,
+            ..unify_move_config(&input, &output)
+        };
+        let mut processor = Processor::new(config).unwrap();
+        let results = processor.run().unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            results
+                .iter()
+                .all(|r| r.status == ProcessingStatus::Success),
+            "unexpected statuses: {:?}",
+            results.iter().map(|r| r.status).collect::<Vec<_>>()
+        );
+
+        // 三个目标名全部存在：基础名 + _1 + _2（顺序不要求）
+        assert!(output.join("IMG_20240115_143000.jpg").exists());
+        assert!(output.join("IMG_20240115_143000_1.jpg").exists());
+        assert!(output.join("IMG_20240115_143000_2.jpg").exists());
+        assert!(!input.join("DSC_0001.jpg").exists());
+        assert!(!input.join("DSC_0002.jpg").exists());
+        assert!(!input.join("DSC_0003.jpg").exists());
+
+        let stats = processor.stats();
+        assert_eq!(stats.processed.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_unify_filenames_millis_distinguishes_duplicate_seconds() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+
+        // 同一秒但毫秒不同 → 文件名带 fff 段，互不冲突
+        fs::write(
+            input.join("DSC_0001.jpg"),
+            exif_jpeg_with_subsec("2024:01:15 14:30:00", "123"),
+        )
+        .unwrap();
+        fs::write(
+            input.join("DSC_0002.jpg"),
+            exif_jpeg_with_subsec("2024:01:15 14:30:00", "456"),
+        )
+        .unwrap();
+
+        let config = Config {
+            threads: 4,
+            ..unify_move_config(&input, &output)
+        };
+        let mut processor = Processor::new(config).unwrap();
+        let results = processor.run().unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(output.join("IMG_20240115_143000123.jpg").exists());
+        assert!(output.join("IMG_20240115_143000456.jpg").exists());
+        assert!(!output.join("IMG_20240115_143000_1.jpg").exists());
+        assert!(!input.join("DSC_0001.jpg").exists());
+        assert!(!input.join("DSC_0002.jpg").exists());
+        assert_eq!(processor.stats().failed.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1644,8 +1944,8 @@ mod tests {
         let target = dir.path().join("20240115_143000.jpg");
 
         // 目标尚不存在但已被本次运行占用 → 追加 _1 后缀
-        let mut occupied = HashSet::new();
-        occupied.insert(target.clone());
+        let mut occupied = HashMap::new();
+        occupied.insert(target.clone(), Some(1));
         let resolved = resolve_filename_conflict_with(target.clone(), &occupied).unwrap();
         assert_eq!(resolved.file_name().unwrap(), "20240115_143000_1.jpg");
 

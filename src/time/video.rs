@@ -1,9 +1,10 @@
 //! Video metadata extraction via FFprobe
 
 use crate::error::{Error, Result};
-use crate::time::datetime::parse_video_datetime;
+use crate::time::datetime::{has_fraction, parse_video_datetime};
 use crate::time::filename::parse_filename_time;
-use chrono::{Local, NaiveDateTime};
+use crate::time::{ExtractedTime, TimeSource};
+use chrono::{Local, NaiveDateTime, Timelike};
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -32,7 +33,10 @@ fn is_ffprobe_available() -> bool {
 /// 2. Attempts to parse the filename for a local timestamp
 /// 3. If filename has a valid timestamp, calculates timezone offset and applies correction
 /// 4. If no valid filename timestamp, converts UTC to local system timezone
-pub fn extract_video_time(path: &Path) -> Result<NaiveDateTime> {
+///
+/// 返回的 [`ExtractedTime`] 携带 `has_millis`：当 FFprobe 时间戳字符串
+/// 显式包含小数秒（如 `2024-01-15T14:30:00.123Z`）时为 `true`。
+pub fn extract_video_time(path: &Path) -> Result<ExtractedTime> {
     // Check if ffprobe is available (cached)
     if !is_ffprobe_available() {
         return Err(Error::FfprobeNotFound);
@@ -76,7 +80,7 @@ pub fn extract_video_time(path: &Path) -> Result<NaiveDateTime> {
         })?;
 
     // Try to find creation time in format tags
-    let mut utc_time: Option<NaiveDateTime> = None;
+    let mut utc_time: Option<(NaiveDateTime, bool)> = None;
 
     if let Some(format) = json.get("format")
         && let Some(tags) = format.get("tags")
@@ -88,7 +92,7 @@ pub fn extract_video_time(path: &Path) -> Result<NaiveDateTime> {
                     && let Some(dt) = parse_video_datetime(value)
                 {
                     debug!(?path, key = tag_key, "Found video creation time");
-                    utc_time = Some(dt);
+                    utc_time = Some((dt, has_fraction(value) || dt.nanosecond() != 0));
                     break;
                 }
             }
@@ -110,7 +114,7 @@ pub fn extract_video_time(path: &Path) -> Result<NaiveDateTime> {
                             && let Some(dt) = parse_video_datetime(value)
                         {
                             debug!(?path, key = tag_key, "Found video creation time in stream");
-                            utc_time = Some(dt);
+                            utc_time = Some((dt, has_fraction(value) || dt.nanosecond() != 0));
                             break 'outer;
                         }
                     }
@@ -119,14 +123,18 @@ pub fn extract_video_time(path: &Path) -> Result<NaiveDateTime> {
         }
     }
 
-    let utc_time = utc_time.ok_or_else(|| Error::VideoMetadata {
+    let (utc_time, has_millis) = utc_time.ok_or_else(|| Error::VideoMetadata {
         path: path.to_path_buf(),
         message: "No creation time found in video metadata".to_string(),
     })?;
 
     // Apply timezone correction
     let corrected_time = apply_timezone_correction(path, utc_time);
-    Ok(corrected_time)
+    Ok(ExtractedTime {
+        timestamp: corrected_time,
+        source: TimeSource::VideoMetadata,
+        has_millis,
+    })
 }
 
 /// Apply timezone correction to UTC video timestamp

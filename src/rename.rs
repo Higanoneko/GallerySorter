@@ -10,11 +10,10 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::process::{collect_media_files, resolve_filename_conflict_with};
-use crate::time::extract_metadata_time;
-use chrono::NaiveDateTime;
+use crate::time::{ExtractedTime, extract_metadata_time};
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -236,14 +235,17 @@ impl RenameStats {
     }
 }
 
-/// 构建标准统一文件名：`<MVIMG|IMG|VID>_YYYYMMDD_HHMMSS` + 原扩展名（保留扩展名大小写）
-pub fn build_unified_filename(
-    source: &Path,
-    timestamp: &NaiveDateTime,
-    config: &Config,
-) -> PathBuf {
+/// 构建标准统一文件名：`<MVIMG|IMG|VID>_YYYYMMDD_HHMMSS[fff]` + 原扩展名（保留扩展名大小写）。
+///
+/// 元数据含毫秒（`has_millis`）时使用 `_YYYYMMDD_HHMMSSfff`，
+/// 否则使用 `_YYYYMMDD_HHMMSS`（同名冲突由调用方追加 `_N` 序号）。
+pub fn build_unified_filename(source: &Path, time: &ExtractedTime, config: &Config) -> PathBuf {
     let prefix = standard_name_prefix(source, config);
-    let stem = format!("{}_{}", prefix, timestamp.format("%Y%m%d_%H%M%S"));
+    let stem = if time.has_millis {
+        format!("{}_{}", prefix, time.timestamp.format("%Y%m%d_%H%M%S%3f"))
+    } else {
+        format!("{}_{}", prefix, time.timestamp.format("%Y%m%d_%H%M%S"))
+    };
     let file_name = match source.extension() {
         Some(ext) => format!("{}.{}", stem, ext.to_string_lossy()),
         None => stem,
@@ -252,8 +254,8 @@ pub fn build_unified_filename(
 }
 
 /// 判断文件当前是否已是标准统一文件名（与目标完全一致）
-pub fn is_already_unified(source: &Path, timestamp: &NaiveDateTime, config: &Config) -> bool {
-    build_unified_filename(source, timestamp, config).as_path() == source
+pub fn is_already_unified(source: &Path, time: &ExtractedTime, config: &Config) -> bool {
+    build_unified_filename(source, time, config).as_path() == source
 }
 
 /// 把未修改（无元数据或重命名失败）的文件路径写入列表文件（原子写：tmp + rename）。
@@ -388,7 +390,7 @@ impl Renamer {
 
                 match extract_metadata_time(path, &config) {
                     Ok(time) => {
-                        let target = build_unified_filename(path, &time.timestamp, &config);
+                        let target = build_unified_filename(path, &time, &config);
                         if target.as_path() == path {
                             (path.clone(), PlannedAction::AlreadyUnified)
                         } else {
@@ -403,7 +405,7 @@ impl Renamer {
         // Phase 2: 顺序重命名（目标冲突加 _N 后缀；取消后已完成的保留）
         info!("Renaming files...");
         let mut results = Vec::with_capacity(planned.len());
-        let mut occupied: HashSet<PathBuf> = HashSet::new();
+        let mut occupied: HashMap<PathBuf, Option<u64>> = HashMap::new();
 
         for (source, action) in planned {
             if cancel.load(Ordering::Relaxed) {
@@ -425,7 +427,7 @@ impl Renamer {
                                 debug!(?source, ?final_target, "Would rename file");
                                 self.stats.handled.fetch_add(1, Ordering::Relaxed);
                                 self.stats.renamed.fetch_add(1, Ordering::Relaxed);
-                                occupied.insert(final_target.clone());
+                                occupied.insert(final_target.clone(), None);
                                 results.push(RenameResult {
                                     source,
                                     destination: Some(final_target),
@@ -442,7 +444,7 @@ impl Renamer {
                                         );
                                         self.stats.handled.fetch_add(1, Ordering::Relaxed);
                                         self.stats.renamed.fetch_add(1, Ordering::Relaxed);
-                                        occupied.insert(final_target.clone());
+                                        occupied.insert(final_target.clone(), None);
                                         results.push(RenameResult {
                                             source,
                                             destination: Some(final_target),
@@ -541,6 +543,20 @@ mod tests {
         NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
     }
 
+    /// 解析含小数秒的时间字符串
+    fn dt_ms(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").unwrap()
+    }
+
+    /// 构造 EXIF 元数据时间（`has_millis` 表示是否含毫秒）
+    fn exif_time(s: &str, has_millis: bool) -> ExtractedTime {
+        ExtractedTime {
+            timestamp: dt(s),
+            source: crate::time::TimeSource::Exif,
+            has_millis,
+        }
+    }
+
     /// 构造带 DateTimeOriginal 的最小 JPEG（APP1 + EXIF TIFF + EOI）
     fn exif_jpeg(datetime: &str) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -560,6 +576,57 @@ mod tests {
         payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
         payload.extend_from_slice(datetime.as_bytes());
         payload.push(0);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        bytes.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        bytes.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        bytes
+    }
+
+    /// 构造带 DateTimeOriginal + SubSecTimeOriginal 的最小 JPEG（毫秒信息）
+    fn exif_jpeg_with_subsec(datetime: &str, subsec: &str) -> Vec<u8> {
+        let dt_len = (datetime.len() + 1) as u32; // 含 NUL
+        let sub_len = (subsec.len() + 1) as u32; // 含 NUL
+        // ASCII 值 ≤ 4 字节（含 NUL）时按 TIFF 规则内联在条目中，不写偏移
+        let sub_inline = sub_len <= 4;
+        let exif_ifd_offset = 0x1A;
+        let dt_offset = exif_ifd_offset + 2 + 24 + 4; // count(2) + 2 entries(24) + next(4)
+        let sub_offset = if sub_inline { 0 } else { dt_offset + dt_len };
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"Exif\0\0");
+        payload.extend_from_slice(b"II\x2A\x00\x08\x00\x00\x00");
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&0x8769u16.to_le_bytes());
+        payload.extend_from_slice(&4u16.to_le_bytes()); // LONG
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&exif_ifd_offset.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(&0x9003u16.to_le_bytes());
+        payload.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+        payload.extend_from_slice(&dt_len.to_le_bytes());
+        payload.extend_from_slice(&dt_offset.to_le_bytes());
+        payload.extend_from_slice(&0x9291u16.to_le_bytes());
+        payload.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+        payload.extend_from_slice(&sub_len.to_le_bytes());
+        if sub_inline {
+            let mut inline = [0u8; 4];
+            inline[..subsec.len()].copy_from_slice(subsec.as_bytes());
+            payload.extend_from_slice(&inline);
+        } else {
+            payload.extend_from_slice(&sub_offset.to_le_bytes());
+        }
+        payload.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+        payload.extend_from_slice(datetime.as_bytes());
+        payload.push(0);
+        if !sub_inline {
+            payload.extend_from_slice(subsec.as_bytes());
+            payload.push(0);
+        }
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0xFF, 0xD8]); // SOI
@@ -599,49 +666,91 @@ mod tests {
 
         // 照片 → IMG 前缀
         let source = dir.join("DSC_0001.jpg");
-        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        let target =
+            build_unified_filename(&source, &exif_time("2024-01-15 14:30:00", false), &config);
         assert_eq!(target, dir.join("IMG_20240115_143000.jpg"));
 
         // 视频 → VID 前缀
         let source = dir.join("DSC_0001.mp4");
-        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        let target =
+            build_unified_filename(&source, &exif_time("2024-01-15 14:30:00", false), &config);
         assert_eq!(target, dir.join("VID_20240115_143000.mp4"));
 
         // RAW → IMG 前缀
         let source = dir.join("DSC_0001.arw");
-        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        let target =
+            build_unified_filename(&source, &exif_time("2024-01-15 14:30:00", false), &config);
         assert_eq!(target, dir.join("IMG_20240115_143000.arw"));
 
         // 动态照片文件名（MVIMG_ 开头）→ MVIMG 前缀
         let source = dir.join("MVIMG_20240115_143000_HDR.jpg");
-        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        let target =
+            build_unified_filename(&source, &exif_time("2024-01-15 14:30:00", false), &config);
         assert_eq!(target, dir.join("MVIMG_20240115_143000.jpg"));
 
         // 扩展名大小写保留
         let source = dir.join("IMG_20240115_143000.JPG");
-        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        let target =
+            build_unified_filename(&source, &exif_time("2024-01-15 14:30:00", false), &config);
         assert_eq!(target, dir.join("IMG_20240115_143000.JPG"));
 
         // 无扩展名
         let source = dir.join("IMG_20240115_143000");
-        let target = build_unified_filename(&source, &dt("2024-01-15 14:30:00"), &config);
+        let target =
+            build_unified_filename(&source, &exif_time("2024-01-15 14:30:00", false), &config);
         assert_eq!(target, dir.join("IMG_20240115_143000"));
+
+        // 元数据含毫秒 → 文件名带 fff 段
+        let source = dir.join("DSC_0001.jpg");
+        let time_ms = ExtractedTime {
+            timestamp: dt_ms("2024-01-15 14:30:00.123"),
+            source: crate::time::TimeSource::Exif,
+            has_millis: true,
+        };
+        let target = build_unified_filename(&source, &time_ms, &config);
+        assert_eq!(target, dir.join("IMG_20240115_143000123.jpg"));
+
+        // 显式 `.000` 也视为含毫秒 → 文件名保留 000
+        let time_zero_ms = ExtractedTime {
+            timestamp: dt_ms("2024-01-15 14:30:00.000"),
+            source: crate::time::TimeSource::Exif,
+            has_millis: true,
+        };
+        let target = build_unified_filename(&source, &time_zero_ms, &config);
+        assert_eq!(target, dir.join("IMG_20240115_143000000.jpg"));
     }
 
     #[test]
     fn test_is_already_unified() {
         let dir = Path::new("/photos");
-        let timestamp = dt("2024-01-15 14:30:00");
+        let time = exif_time("2024-01-15 14:30:00", false);
         let config = Config::default();
 
         assert!(is_already_unified(
             &dir.join("IMG_20240115_143000.jpg"),
-            &timestamp,
+            &time,
             &config
         ));
         assert!(!is_already_unified(
             &dir.join("20240115_143000.jpg"),
-            &timestamp,
+            &time,
+            &config
+        ));
+
+        // 元数据含毫秒 → 无 fff 的标准名不再视为“已统一”
+        let time_ms = ExtractedTime {
+            timestamp: dt_ms("2024-01-15 14:30:00.123"),
+            source: crate::time::TimeSource::Exif,
+            has_millis: true,
+        };
+        assert!(!is_already_unified(
+            &dir.join("IMG_20240115_143000.jpg"),
+            &time_ms,
+            &config
+        ));
+        assert!(is_already_unified(
+            &dir.join("IMG_20240115_143000123.jpg"),
+            &time_ms,
             &config
         ));
     }
@@ -867,6 +976,39 @@ mod tests {
         assert_eq!(stats.already_unified.load(Ordering::Relaxed), 1);
         assert_eq!(stats.no_metadata.load(Ordering::Relaxed), 1);
         assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_renamer_uses_millis_to_avoid_conflicts() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        // 同一秒但毫秒不同 → 文件名带 fff 段，无需 _N 序号
+        fs::write(
+            input.join("DSC_0001.jpg"),
+            exif_jpeg_with_subsec("2024:01:15 14:30:00", "123"),
+        )
+        .unwrap();
+        fs::write(
+            input.join("DSC_0002.jpg"),
+            exif_jpeg_with_subsec("2024:01:15 14:30:00", "456"),
+        )
+        .unwrap();
+
+        let config = rename_config(&input);
+        let mut renamer = Renamer::new(config).unwrap();
+        let results = renamer.run().unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(renamer.stats().renamed.load(Ordering::Relaxed), 2);
+        assert_eq!(renamer.stats().failed.load(Ordering::Relaxed), 0);
+
+        assert!(input.join("IMG_20240115_143000123.jpg").exists());
+        assert!(input.join("IMG_20240115_143000456.jpg").exists());
+        assert!(!input.join("IMG_20240115_143000_1.jpg").exists());
+        assert!(!input.join("DSC_0001.jpg").exists());
+        assert!(!input.join("DSC_0002.jpg").exists());
     }
 
     #[test]

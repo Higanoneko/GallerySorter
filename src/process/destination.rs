@@ -38,7 +38,7 @@ pub(super) fn destination_file_name(
 
     match time_info.source {
         TimeSource::Exif | TimeSource::VideoMetadata => {
-            build_unified_filename(source, &time_info.timestamp, config)
+            build_unified_filename(source, time_info, config)
                 .file_name()
                 .map(PathBuf::from)
                 .unwrap_or(original)

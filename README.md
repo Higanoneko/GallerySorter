@@ -113,8 +113,12 @@ output directory with standard camera names: `IMG_YYYYMMDD_HHMMSS.ext` for
 photos and RAW files, `MVIMG_YYYYMMDD_HHMMSS.ext` for dynamic (Motion Photo)
 files, and `VID_YYYYMMDD_HHMMSS.ext` for videos. The configured operation
 (copy/move/hardlink/symlink) still applies, so files are both renamed and
-placed into the output directory. Collisions get `_1`, `_2`, ... suffixes
-automatically.
+placed into the output directory. When the EXIF/FFprobe metadata contains
+milliseconds, the millisecond part is kept in the name
+(`IMG_YYYYMMDD_HHMMSSfff.ext`); otherwise same-second collisions are resolved
+automatically with `_1`, `_2`, ... suffixes. All destination names are decided
+before any copy/move/link operation, so files with identical base names can
+never overwrite each other.
 
 With `--preserve-standard-names`, files whose names already follow the standard
 camera pattern — `MVIMG_`, `IMG_` or `VID_` followed by `_YYYYMMDD_HHMMSS`,

@@ -37,6 +37,11 @@ pub struct ExtractedTime {
     pub timestamp: NaiveDateTime,
     /// Source of the timestamp
     pub source: TimeSource,
+    /// 元数据（EXIF SubSec / FFprobe 时间戳）中是否含有毫秒（亚秒）信息。
+    ///
+    /// 统一文件名时据此决定是否附带 `HHMMSSfff` 毫秒段：
+    /// 有毫秒 → `_YYYYMMDD_HHMMSSfff`；无毫秒 → 冲突时追加 `_N` 序号。
+    pub has_millis: bool,
 }
 
 /// Unified datetime parsing utilities
@@ -118,6 +123,18 @@ pub mod datetime {
         let s = s.trim().trim_matches('"');
         parse_multi(s, DATE_FORMATS)
     }
+
+    /// 判断元数据字符串是否显式包含小数秒（如 `2024-01-15T14:30:00.123Z`）。
+    ///
+    /// 与 `nanosecond() != 0` 的区别：`...00.000Z` 也视为“含毫秒”，
+    /// 文件名中保留 `000` 段，语义上保持“有毫秒就用 fff”的规则。
+    pub fn has_fraction(s: &str) -> bool {
+        let trimmed = s.trim();
+        let Some((_, frac)) = trimmed.split_once('.') else {
+            return false;
+        };
+        frac.chars().next().is_some_and(|c| c.is_ascii_digit())
+    }
 }
 
 /// Extract creation time from a media file using multiple strategies
@@ -134,10 +151,7 @@ pub fn extract_time(path: &Path, config: &Config) -> Result<ExtractedTime> {
     if config.is_image(ext) {
         if let Ok(time) = exif::extract_exif_time(path) {
             debug!(?path, "Extracted time from EXIF");
-            return Ok(ExtractedTime {
-                timestamp: time,
-                source: TimeSource::Exif,
-            });
+            return Ok(time);
         }
         debug!(?path, "No EXIF time found, trying other methods");
     }
@@ -146,10 +160,7 @@ pub fn extract_time(path: &Path, config: &Config) -> Result<ExtractedTime> {
     if config.is_video(ext) {
         if let Ok(time) = video::extract_video_time(path) {
             debug!(?path, "Extracted time from video metadata");
-            return Ok(ExtractedTime {
-                timestamp: time,
-                source: TimeSource::VideoMetadata,
-            });
+            return Ok(time);
         }
         debug!(?path, "No video metadata time found, trying other methods");
     }
@@ -161,6 +172,7 @@ pub fn extract_time(path: &Path, config: &Config) -> Result<ExtractedTime> {
             return Ok(ExtractedTime {
                 timestamp: time,
                 source: TimeSource::Filename,
+                has_millis: false,
             });
         }
         debug!(?path, "No time found in filename, using file system time");
@@ -177,6 +189,7 @@ pub fn extract_time(path: &Path, config: &Config) -> Result<ExtractedTime> {
     Ok(ExtractedTime {
         timestamp: naive,
         source: TimeSource::FileSystem,
+        has_millis: false,
     })
 }
 
@@ -188,19 +201,11 @@ pub fn extract_metadata_time(path: &Path, config: &Config) -> Result<ExtractedTi
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     if config.is_image(ext) {
-        let timestamp = exif::extract_exif_time(path)?;
-        return Ok(ExtractedTime {
-            timestamp,
-            source: TimeSource::Exif,
-        });
+        return exif::extract_exif_time(path);
     }
 
     if config.is_video(ext) {
-        let timestamp = video::extract_video_time(path)?;
-        return Ok(ExtractedTime {
-            timestamp,
-            source: TimeSource::VideoMetadata,
-        });
+        return video::extract_video_time(path);
     }
 
     Err(Error::UnsupportedFormat {
@@ -242,5 +247,15 @@ mod tests {
         let result = extract_metadata_time(&path, &Config::default());
 
         assert!(matches!(result, Err(Error::UnsupportedFormat { .. })));
+    }
+
+    #[test]
+    fn test_has_fraction() {
+        assert!(datetime::has_fraction("2024-01-15T14:30:00.123Z"));
+        assert!(datetime::has_fraction("2024-01-15T14:30:00.000Z"));
+        assert!(datetime::has_fraction("2024-01-15 14:30:00.5"));
+        assert!(!datetime::has_fraction("2024-01-15T14:30:00Z"));
+        assert!(!datetime::has_fraction("2024-01-15 14:30:00"));
+        assert!(!datetime::has_fraction("invalid"));
     }
 }

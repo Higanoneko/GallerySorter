@@ -551,7 +551,10 @@ dry_run = false
 
 # Unify filenames based on EXIF / FFprobe metadata while organizing.
 # Photos/RAW become IMG_YYYYMMDD_HHMMSS, dynamic photos MVIMG_YYYYMMDD_HHMMSS,
-# videos VID_YYYYMMDD_HHMMSS; the configured operation (copy/move/...) still applies.
+# videos VID_YYYYMMDD_HHMMSS; when metadata contains milliseconds the names use
+# IMG_YYYYMMDD_HHMMSSfff. All destination names are resolved before operations,
+# so same-name files get _1/_2 suffixes instead of overwriting each other.
+# The configured operation (copy/move/...) still applies.
 # Files without EXIF/FFprobe metadata keep their names and are listed in
 # unmodified_files.txt under the output directory.
 unify_filenames = false
